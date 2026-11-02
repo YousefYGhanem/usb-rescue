@@ -1,0 +1,324 @@
+<#
+.SYNOPSIS
+  Recover files from a USB drive that Windows reports as "corrupted and unreadable" or RAW.
+
+.DESCRIPTION
+  Never writes to the USB drive. Everything after step 2 works on a sector-by-sector copy:
+    1. Diagnose - show what Windows sees (size, partitions, file system).
+    2. Image    - copy every sector to <OutDir>\usb.vhd. Unreadable sectors are zero-filled and
+                  listed in bad-sectors.txt. If the drive drops out, rerun the script: it resumes.
+    3. Repair   - restore the copy's boot sector from the backup every FAT32 / exFAT / NTFS volume
+                  keeps (the usual cause of "RAW" / "corrupted and unreadable").
+    4. Copy out - mount the copy, run chkdsk on the COPY if files fail, and copy everything to
+                  <OutDir>\files with original names and folders.
+    5. Carve    - optional PhotoRec deep scan into <OutDir>\carved: finds photos, documents, videos,
+                  archives... by their content even when the file system is gone (names are lost).
+
+  Run from an Administrator PowerShell:
+    powershell -ExecutionPolicy Bypass -File .\Recover-UsbDrive.ps1
+
+.PARAMETER DiskNumber
+  Disk number of the USB drive (as in Disk Management). Asked for if omitted.
+.PARAMETER OutDir
+  Where the image and recovered files go. Must be on another drive with free space of about
+  twice the USB drive's size. Default: <internal drive with most free space>:\UsbRecovery
+.PARAMETER SkipCarve
+  Don't offer the PhotoRec deep scan.
+#>
+[CmdletBinding()]
+param([int]$DiskNumber = -1, [string]$OutDir, [switch]$SkipCarve)
+$ErrorActionPreference = 'Stop'
+
+$me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Run this from an Administrator PowerShell (right-click Start > Terminal (Admin)).'
+}
+
+# .NET Framework's FileStream refuses \\.\ device paths, so open the raw disk through CreateFile.
+$rawDiskCs = @'
+using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class RawDisk {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+    public static SafeFileHandle OpenRead(string name) {
+        // GENERIC_READ only, share read+write, OPEN_EXISTING: nothing is ever written to the drive
+        SafeFileHandle h = CreateFile(name, 0x80000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        if (h.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return h;
+    }
+}
+'@
+
+function Step($t) { Write-Host "`n=== $t ===" -ForegroundColor Cyan }
+
+function Read-At($fs, [long]$off, [int]$n) {
+    $b = New-Object byte[] $n
+    $fs.Position = $off
+    $r = 0
+    while ($r -lt $n) { $k = $fs.Read($b, $r, $n - $r); if ($k -le 0) { break }; $r += $k }
+    , $b
+}
+
+# Which file system a boot sector belongs to, or $null if it is damaged.
+function Get-BootFs([byte[]]$b) {
+    if ($b.Length -lt 512 -or $b[510] -ne 0x55 -or $b[511] -ne 0xAA) { return $null }
+    $a = [Text.Encoding]::ASCII
+    if ($a.GetString($b, 3, 8) -eq 'EXFAT   ') { if ($b[108] -ge 9 -and $b[108] -le 12) { return 'exFAT' }; return $null }
+    $bps = [BitConverter]::ToUInt16($b, 11)
+    if ($bps -notin 512, 1024, 2048, 4096 -or $b[13] -eq 0) { return $null }
+    if ($a.GetString($b, 3, 8) -eq 'NTFS    ') { return 'NTFS' }
+    if ($a.GetString($b, 82, 5) -eq 'FAT32') { return 'FAT32' }
+    if ($a.GetString($b, 54, 3) -eq 'FAT') { return 'FAT' }
+    $null
+}
+
+# 512-byte footer that turns a raw image into a fixed-size VHD Windows can mount (VHD spec v1.0).
+function New-VhdFooter([long]$size) {
+    $f = New-Object byte[] 512
+    $a = [Text.Encoding]::ASCII
+    function BE([int]$off, [byte[]]$le) { [Array]::Reverse($le); $le.CopyTo($f, $off) }
+    $a.GetBytes('conectix').CopyTo($f, 0)
+    BE 8  ([BitConverter]::GetBytes([uint32]2))            # features
+    BE 12 ([BitConverter]::GetBytes([uint32]0x10000))      # format version 1.0
+    BE 16 ([BitConverter]::GetBytes([int64]-1))            # data offset: none (fixed disk)
+    BE 24 ([BitConverter]::GetBytes([uint32]([DateTime]::UtcNow - [DateTime]'2000-01-01').TotalSeconds))
+    $a.GetBytes('rcvr').CopyTo($f, 28)
+    BE 32 ([BitConverter]::GetBytes([uint32]0x10000))
+    $a.GetBytes('Wi2k').CopyTo($f, 36)
+    BE 40 ([BitConverter]::GetBytes([int64]$size))         # original size
+    BE 48 ([BitConverter]::GetBytes([int64]$size))         # current size
+    $ts = [math]::Min([long]($size / 512), 65535L * 16 * 255)
+    if ($ts -ge 65535L * 16 * 63) { $spt = 255; $hd = 16; $cth = [math]::Floor($ts / $spt) }
+    else {
+        $spt = 17; $cth = [math]::Floor($ts / $spt); $hd = [math]::Max([math]::Floor(($cth + 1023) / 1024), 4)
+        if ($cth -ge $hd * 1024 -or $hd -gt 16) { $spt = 31; $hd = 16; $cth = [math]::Floor($ts / $spt) }
+        if ($cth -ge $hd * 1024) { $spt = 63; $hd = 16; $cth = [math]::Floor($ts / $spt) }
+    }
+    BE 56 ([BitConverter]::GetBytes([uint16][math]::Floor($cth / $hd)))
+    $f[58] = [byte]$hd; $f[59] = [byte]$spt
+    BE 60 ([BitConverter]::GetBytes([uint32]2))            # disk type: fixed
+    [guid]::NewGuid().ToByteArray().CopyTo($f, 68)
+    $sum = 0L; foreach ($x in $f) { $sum += $x }
+    BE 64 ([BitConverter]::GetBytes([uint32]([uint32]::MaxValue - $sum)))   # one's complement checksum
+    , $f
+}
+
+function Read-Into($src, $buf, [long]$pos, [int]$o, [int]$len) {
+    try {
+        $src.Position = $pos + $o; $r = 0
+        while ($r -lt $len) { $k = $src.Read($buf, $o + $r, $len - $r); if ($k -le 0) { return $false }; $r += $k }
+        $true
+    } catch { $script:lastReadError = $_.Exception.Message; $false }
+}
+
+function Copy-Disk([int]$num, [long]$size, [int]$ss, [string]$img, [string]$log) {
+    $chunk = 1MB
+    $have = if (Test-Path $img) { (Get-Item $img).Length } else { 0L }
+    if ($have -eq $size + 512) { Write-Host "Image already complete: $img"; return }
+    if (-not ('RawDisk' -as [type])) { Add-Type -TypeDefinition $rawDiskCs }
+    $src = [IO.FileStream]::new([RawDisk]::OpenRead("\\.\PhysicalDrive$num"), [IO.FileAccess]::Read, 1)
+    $dst = [IO.FileStream]::new($img, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write)
+    try {
+        $pos = [math]::Min([long][math]::Floor($have / $chunk) * $chunk, $size)
+        if ($pos -gt 0) { Write-Host "Resuming at $([math]::Round($pos / 1MB)) MB" }
+        $dst.SetLength($pos); $dst.Position = $pos
+        $buf = New-Object byte[] $chunk
+        $bad = 0; $dead = 0; $retried = 0; $i = 0; $start = $pos; $t = [Diagnostics.Stopwatch]::StartNew()
+        while ($pos -lt $size) {
+            $n = [int][math]::Min([long]$chunk, $size - $pos)   # [long] or PowerShell picks Min(int,int) and overflows on drives > 2 GB
+            if (Read-Into $src $buf $pos 0 $n) { $dead = 0 }
+            else {
+                if (++$retried -eq 1) { Write-Warning "Read error at $([math]::Round($pos / 1MB)) MB ($script:lastReadError) - retrying that part in smaller pieces." }
+                # Retry this 1 MB in 64 KB pieces, and only failing pieces sector by sector; zero-fill what can't be read.
+                [Array]::Clear($buf, 0, $n); $good = 0
+                for ($o = 0; $o -lt $n; $o += 64KB) {
+                    $m = [math]::Min(64KB, $n - $o)
+                    if (Read-Into $src $buf $pos $o $m) { $good++; continue }
+                    for ($s = $o; $s -lt $o + $m; $s += $ss) {
+                        if (Read-Into $src $buf $pos $s $ss) { $good++; continue }
+                        [Array]::Clear($buf, $s, $ss); $bad++
+                        Add-Content $log ('sector {0} (byte offset {1})' -f (($pos + $s) / $ss), ($pos + $s))
+                    }
+                }
+                if ($good) { $dead = 0 }
+                elseif (++$dead -ge 32) {
+                    # 32 MB in a row unreadable: the drive has most likely dropped off the bus.
+                    $dst.SetLength($pos - ($dead - 1) * $chunk)   # so a rerun retries this stretch
+                    throw "The drive stopped responding at $([math]::Round($pos / 1MB)) MB. Unplug it, wait 10 seconds, plug it into a different port and run the script again - it resumes from here."
+                }
+            }
+            $dst.Write($buf, 0, $n); $pos += $n
+            if ((++$i % 32) -eq 0) {
+                $mbs = ($pos - $start) / 1MB / [math]::Max($t.Elapsed.TotalSeconds, 1)
+                Write-Progress -Activity 'Imaging USB drive (read-only)' -PercentComplete ([int](100 * $pos / $size)) `
+                    -Status ('{0:N0} / {1:N0} MB   {2:N1} MB/s   MB needing retries: {3}   unreadable sectors: {4}' -f ($pos / 1MB), ($size / 1MB), $mbs, $retried, $bad)
+            }
+        }
+        $footer = New-VhdFooter $size
+        $dst.Write($footer, 0, 512)
+        Write-Progress -Activity 'Imaging USB drive (read-only)' -Completed
+        if ($bad) { Write-Warning "$bad unreadable sectors were zero-filled (list: $log). Files touching them may be partly damaged." }
+        else { Write-Host 'Every sector read fine - the drive hardware looks OK, only the file system is damaged.' -ForegroundColor Green }
+    } finally { $src.Dispose(); $dst.Dispose() }
+}
+
+function Repair-BootSectors([string]$img, $layout, [int]$ss) {
+    $fs = [IO.FileStream]::new($img, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
+    try {
+        foreach ($p in $layout) {
+            $off = [long]$p.Offset; $label = "Partition at $([math]::Round($off / 1MB)) MB"
+            $cur = Get-BootFs (Read-At $fs $off $ss)
+            if ($cur) { Write-Host "$label : $cur boot sector looks OK"; continue }
+            $done = $false
+            # Backup locations: FAT32 sectors 6-8, exFAT sectors 12-23, NTFS last sector of the partition.
+            foreach ($c in @(('FAT32', 6, 3), ('exFAT', 12, 12), ('NTFS', ([long]($p.Size / $ss) - 1), 1))) {
+                $at = $off + $c[1] * $ss
+                if ((Get-BootFs (Read-At $fs $at $ss)) -eq $c[0]) {
+                    $data = Read-At $fs $at ($c[2] * $ss)
+                    $fs.Position = $off; $fs.Write($data, 0, $data.Length)
+                    Write-Host "$label : boot sector was damaged - restored from the $($c[0]) backup copy" -ForegroundColor Green
+                    $done = $true; break
+                }
+            }
+            if (-not $done) { Write-Warning "$label : boot sector damaged and no usable backup found (FAT12/FAT16 keep none). The next steps still try." }
+        }
+    } finally { $fs.Dispose() }
+}
+
+function Copy-Out([string]$from, [string]$to, [string]$log) {
+    robocopy $from $to /E /COPY:DT /DCOPY:T /R:0 /W:0 /XJ /NP /NFL /NDL /XD '$RECYCLE.BIN' 'System Volume Information' "/LOG+:$log" /TEE | Out-Host
+    $LASTEXITCODE   # 0-7 = fine, 8+ = some files failed
+}
+
+function Get-TestDisk([string]$dir) {
+    $find = { Get-ChildItem $dir -Recurse -Filter photorec_win.exe -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    $exe = & $find
+    if (-not $exe) {
+        Write-Host 'Downloading TestDisk/PhotoRec 7.2 (free, open source, cgsecurity.org)...'
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $zip = "$dir.zip"
+            Invoke-WebRequest 'https://www.cgsecurity.org/testdisk-7.2.win64.zip' -OutFile $zip -UseBasicParsing
+            Expand-Archive $zip $dir -Force; Remove-Item $zip
+            $exe = & $find
+        } catch { Write-Warning "Download failed: $_" }
+    }
+    if (-not $exe) { Write-Warning "Download TestDisk for Windows from https://www.cgsecurity.org/wiki/TestDisk_Download, unzip it into $dir and run the script again."; return $null }
+    $exe.DirectoryName
+}
+
+# ---------------------------------------------------------------------------------------------
+Step '1/5 Diagnose'
+if ($DiskNumber -lt 0) {
+    $usb = @(Get-Disk | Where-Object BusType -eq 'USB')
+    if (-not $usb) { throw 'No USB disk found. Try another port (back of the PC) or cable, then check Disk Management.' }
+    $usb | Format-Table Number, FriendlyName, @{n = 'SizeGB'; e = { [math]::Round($_.Size / 1GB, 2) } }, PartitionStyle, OperationalStatus -AutoSize | Out-Host
+    $DiskNumber = if ($usb.Count -eq 1) { $usb[0].Number } else { [int](Read-Host 'Disk number of the broken USB drive') }
+}
+$disk = Get-Disk -Number $DiskNumber
+if ($disk.IsBoot -or $disk.IsSystem) { throw "Disk $DiskNumber is your Windows disk, not the USB drive." }
+$size = [long]$disk.Size
+$ss = [int]$disk.LogicalSectorSize
+if ($size -le 0) { throw 'The drive reports 0 bytes / No Media: its controller has failed. Only a data-recovery lab can help now - stop plugging it in.' }
+$parts = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue | Where-Object { $_.Type -notin 'Reserved', 'Extended' })
+Write-Host ("Disk {0}: {1}, {2:N2} GB, partition style {3}, {4}-byte sectors, status {5}" -f $DiskNumber, $disk.FriendlyName, ($size / 1GB), $disk.PartitionStyle, $ss, $disk.OperationalStatus)
+foreach ($p in $parts) {
+    $v = $p | Get-Volume -ErrorAction SilentlyContinue
+    Write-Host ("  Partition {0}: starts at {1:N0} MB, {2:N2} GB, letter '{3}', file system '{4}'" -f $p.PartitionNumber, ($p.Offset / 1MB), ($p.Size / 1GB), $p.DriveLetter, $v.FileSystem)
+}
+if (-not $parts) { Write-Warning 'No partitions visible - the partition table itself is damaged. Imaging anyway; see the TestDisk tip at the end.' }
+
+$usbLetters = @($parts | ForEach-Object { [string]$_.DriveLetter } | Where-Object { $_ -match '[A-Z]' })
+if (-not $OutDir) {
+    $best = Get-Volume | Where-Object { $_.DriveType -eq 'Fixed' -and [string]$_.DriveLetter -match '[A-Z]' -and [string]$_.DriveLetter -notin $usbLetters } |
+        Sort-Object SizeRemaining -Descending | Select-Object -First 1
+    $OutDir = "$($best.DriveLetter):\UsbRecovery"
+}
+if ($OutDir -notmatch '^[A-Za-z]:\\') { throw 'OutDir must be a local path like D:\UsbRecovery' }
+if ([string]$OutDir[0] -in $usbLetters) { throw 'OutDir must NOT be on the USB drive you are recovering.' }
+New-Item -ItemType Directory -Force $OutDir | Out-Null
+$img = Join-Path $OutDir 'usb.vhd'
+$need = $size + 512 - $(if (Test-Path $img) { (Get-Item $img).Length } else { 0 })
+$free = (Get-PSDrive $OutDir.Substring(0, 1)).Free
+if ($free -lt $need) { throw ("Not enough space in {0}: need {1:N1} GB free for the image, have {2:N1} GB. Use -OutDir on a bigger drive." -f $OutDir, ($need / 1GB), ($free / 1GB)) }
+if ($free -lt $need + $size) { Write-Warning 'There may not be enough free space for both the image and the recovered files.' }
+Write-Host "Output folder: $OutDir"
+
+Step '2/5 Image the drive (read-only)'
+Copy-Disk $DiskNumber $size $ss $img (Join-Path $OutDir 'bad-sectors.txt')
+
+Step '3/5 Repair boot sectors on the copy'
+$layout = if ($parts) { $parts } else { , [pscustomobject]@{ Offset = 0L; Size = $size } }
+Repair-BootSectors $img $layout $ss
+
+Step '4/5 Mount the copy and copy files out'
+Write-Host 'Unplug the USB drive now - the rest works on the copy (this also avoids a disk-signature clash).' -ForegroundColor Yellow
+Write-Host 'If Windows pops up "You need to format the disk", click CANCEL.' -ForegroundColor Yellow
+Read-Host 'Press Enter when it is unplugged' | Out-Null
+$filesDir = Join-Path $OutDir 'files'
+$rlog = Join-Path $OutDir 'robocopy.log'
+$failed = $false
+$vhd = Mount-DiskImage -ImagePath $img -StorageType VHD -Access ReadWrite -PassThru
+try {
+    $vdisk = $vhd | Get-Disk
+    if ($vdisk.IsOffline) { Set-Disk -Number $vdisk.Number -IsOffline $false }
+    if ($vdisk.IsReadOnly) { Set-Disk -Number $vdisk.Number -IsReadOnly $false }
+    Start-Sleep 2
+    $vparts = @(Get-Partition -DiskNumber $vdisk.Number -ErrorAction SilentlyContinue | Where-Object { $_.Type -notin 'Reserved', 'Extended' })
+    if (-not $vparts) { Write-Warning 'Windows sees no partitions on the copy (partition table destroyed).'; $failed = $true }
+    foreach ($p in $vparts) {
+        if ([string]$p.DriveLetter -notmatch '[A-Z]') {
+            try { $p | Add-PartitionAccessPath -AssignDriveLetter; $p = Get-Partition -DiskNumber $vdisk.Number -PartitionNumber $p.PartitionNumber } catch {}
+        }
+        $L = [string]$p.DriveLetter
+        if ($L -notmatch '[A-Z]') { Write-Warning "Partition $($p.PartitionNumber): could not assign a drive letter."; $failed = $true; continue }
+        $fsName = (Get-Volume -DriveLetter $L).FileSystem
+        if (-not $fsName -or $fsName -eq 'RAW') { Write-Warning "Partition $($p.PartitionNumber) (${L}:): file system still unreadable."; $failed = $true; continue }
+        $dest = Join-Path $filesDir "partition$($p.PartitionNumber)"
+        Write-Host "Copying ${L}: ($fsName) -> $dest"
+        $rc = Copy-Out "${L}:\" $dest $rlog
+        if ($rc -ge 8) {
+            Write-Host 'Some files could not be read. Running chkdsk on the COPY (your USB drive is not touched)...' -ForegroundColor Yellow
+            cmd /c "echo Y| chkdsk ${L}: /f /x" | Out-Host   # "Y" = save lost chains as files in FOUND.000
+            $rc = Copy-Out "${L}:\" $dest $rlog
+        }
+        if ($rc -ge 8) { $failed = $true; Write-Warning "Some files still failed - they are listed in $rlog" }
+    }
+} finally {
+    Dismount-DiskImage -ImagePath $img | Out-Null
+}
+$count = @(Get-ChildItem $filesDir -Recurse -File -ErrorAction SilentlyContinue).Count
+Write-Host "Recovered with names and folders: $count files in $filesDir" -ForegroundColor Green
+
+$td = $null; $carve = $null
+if (-not $SkipCarve) {
+    Step '5/5 Deep scan with PhotoRec (optional)'
+    $def = if ($count -and -not $failed) { 'n' } else { 'y' }
+    $ans = Read-Host "Scan the whole copy for lost or deleted files by content? Names/folders are lost; can take hours. (y/n) [$def]"
+    if (-not $ans) { $ans = $def }
+    if ($ans -match '^y') {
+        $td = Get-TestDisk (Join-Path $OutDir 'testdisk')
+        if ($td) {
+            $carve = Join-Path $OutDir 'carved'
+            New-Item -ItemType Directory -Force $carve | Out-Null   # PhotoRec fails if the parent folder is missing
+            Push-Location $OutDir
+            try { & (Join-Path $td 'photorec_win.exe') /log /d (Join-Path $carve 'recup') /cmd $img 'partition_none,fileopt,everything,enable,search' }
+            finally { Pop-Location }
+            $n = @(Get-ChildItem $carve -Recurse -File -Exclude report.xml -ErrorAction SilentlyContinue).Count
+            Write-Host "PhotoRec recovered $n files into $carve (recup.1, recup.2... folders)" -ForegroundColor Green
+        }
+    }
+}
+
+Step 'Done'
+Write-Host "Files with original names : $filesDir"
+if ($carve) { Write-Host "Files found by deep scan  : $carve" }
+Write-Host "Drive image               : $img"
+Write-Host '  Keep the image until you have checked your files, then delete it. You can reformat the USB drive after that'
+Write-Host '  (if it gets corrupted again soon, the drive is failing - replace it).'
+if ($failed) {
+    $tdExe = if ($td) { Join-Path $td 'testdisk_win.exe' } else { "$OutDir\testdisk\...\testdisk_win.exe" }
+    Write-Host "`nA partition was still unreadable. TestDisk can search the image for lost partitions and copy files out:" -ForegroundColor Yellow
+    Write-Host "  & '$tdExe' '$img'"
+    Write-Host '  Proceed > Intel (or EFI GPT) > Analyse > Quick Search (then Deeper Search) > highlight the partition > P to list files > C to copy.'
+}
