@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.1 - 2026-11-02
+
+### Security
+- The PhotoRec/TestDisk download is checked against a pinned SHA256 before it is unzipped or run. A mismatched file is deleted.
+- Added a security policy (`SECURITY.md`) with private vulnerability reporting.
+
+### Quality
+- CI on every push and pull request: Windows end-to-end test on real virtual disks (FAT32/exFAT/NTFS), PSScriptAnalyzer, parse and ASCII checks, the Python model tests, and a weekly check of the PhotoRec download.
+- Dependabot keeps the CI actions up to date; actions are pinned to commit SHAs.
+- Contributing guide, issue templates (with a privacy note for logs), and a pull request checklist.
+- `.bat` files are always checked out with Windows (CRLF) line endings.
+
 ## 1.1.0 - 2026-11-02
 
 ### Added

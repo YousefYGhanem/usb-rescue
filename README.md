@@ -1,5 +1,7 @@
 # usb-rescue
 
+[![CI](https://github.com/YousefYGhanem/usb-rescue/actions/workflows/ci.yml/badge.svg)](https://github.com/YousefYGhanem/usb-rescue/actions/workflows/ci.yml) [![Latest release](https://img.shields.io/github/v/release/YousefYGhanem/usb-rescue)](https://github.com/YousefYGhanem/usb-rescue/releases/latest) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 **Get your files back from a USB drive or SD card that Windows says is corrupted.**
 
 Use it when Windows shows one of these:
@@ -14,7 +16,7 @@ usb-rescue is a single PowerShell script for Windows 10/11. It needs nothing to 
 
 ## Quick start
 
-1. **Download**: on this page click **Code > Download ZIP**, then unzip it.
+1. **Download** the ZIP from the [latest release](https://github.com/YousefYGhanem/usb-rescue/releases/latest), then unzip it.
 2. **Plug in the broken drive.** Plug in only that one USB drive, and use a port on the back of the PC.
 3. **Double-click `Recover-UsbDrive.bat`** and click **Yes** on the Administrator prompt.
 4. Follow the prompts. If Windows offers to **format** anything, click **Cancel**.
@@ -83,18 +85,16 @@ powershell -ExecutionPolicy Bypass -File .\Recover-UsbDrive.ps1 [-DiskNumber 2] 
 
 Cheap "Generic Flash Disk" sticks often **report more capacity than they really have**. Once the real capacity is full, they silently overwrite old data, which causes exactly this kind of corruption. After recovering your files, test the drive with [H2testw](https://www.heise.de/download/product/h2testw-50539) or [f3](https://github.com/AltraMayor/f3). Both tests erase the drive. If the drive fails the test, or gets corrupted again, throw it away.
 
-## Tests
+## Tests and security
 
-The tests run on Linux with Python 3:
+Every push is checked by [CI](https://github.com/YousefYGhanem/usb-rescue/actions/workflows/ci.yml):
 
-```bash
-sudo apt install dosfstools exfatprogs ntfs-3g mtools
-python3 tests/check_backups.py    # boot-sector repair on real FAT32/exFAT/NTFS images
-python3 tests/check_two_pass.py   # two-pass imaging model: bad sectors + drive dropouts + resume
-```
+- **Windows end-to-end test:** builds FAT32, exFAT and NTFS virtual disks, wipes their boot sectors, then images, repairs and mounts them with the script's own code, and checks the file comes back intact.
+- **Lint:** parse check, ASCII check and PSScriptAnalyzer.
+- **Model tests:** boot-sector repair on real file-system images, and two-pass imaging with bad sectors and drive dropouts.
+- **Download check:** confirms the PhotoRec download still matches the pinned SHA256 (also runs weekly).
 
-- `check_backups.py` builds real FAT32, exFAT and NTFS images, wipes their boot sectors, and checks that the script's repair rules make the files readable again.
-- `check_two_pass.py` simulates a drive with bad sectors that disconnects at different points during imaging. It checks that, after resuming, the copy matches the drive exactly, with zeros only at the bad sectors.
+See [CONTRIBUTING.md](CONTRIBUTING.md) to run the tests yourself, and [SECURITY.md](SECURITY.md) for what the script can and can't touch, and how to report a vulnerability.
 
 ## Requirements
 

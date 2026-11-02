@@ -32,7 +32,10 @@
 [CmdletBinding()]
 param([int]$DiskNumber = -1, [string]$OutDir, [switch]$SkipCarve)
 $ErrorActionPreference = 'Stop'
-$Version = '1.1.0'
+$Version = '1.1.1'
+# SHA256 of testdisk-7.2.win64.zip. The download is refused if it doesn't match (it runs as Administrator).
+# CI re-checks this every week against the live download.
+$TestDiskSha256 = ''
 
 $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -256,6 +259,8 @@ function Get-TestDisk([string]$dir) {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $zip = "$dir.zip"
             Invoke-WebRequest 'https://www.cgsecurity.org/testdisk-7.2.win64.zip' -OutFile $zip -UseBasicParsing
+            $h = (Get-FileHash $zip -Algorithm SHA256).Hash
+            if ($TestDiskSha256 -and $h -ne $TestDiskSha256) { Remove-Item $zip; throw "integrity check failed (SHA256 $h is not the expected $TestDiskSha256) - not running it" }
             Expand-Archive $zip $dir -Force; Remove-Item $zip
             $exe = & $find
         } catch { Write-Warning "Download failed: $_" }

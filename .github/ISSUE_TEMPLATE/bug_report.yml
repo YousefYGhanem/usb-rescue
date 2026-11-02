@@ -1,0 +1,42 @@
+name: Bug report
+description: The script failed, crashed or didn't recover something it should have
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Keep your drive safe while you wait:** don't format it or run chkdsk on it. The copy in `UsbRecovery\usb.vhd` is all the script needs.
+        **Privacy:** logs can contain your file and folder names. Remove anything private before posting.
+  - type: input
+    id: version
+    attributes:
+      label: usb-rescue version
+      description: Shown on the first line when the script starts, e.g. 1.1.1
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 23H2
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected, and what happened instead. Paste the error text, or attach a screenshot.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnose
+    attributes:
+      label: Step 1 output
+      description: The "1/5 Diagnose" block (disk size, partition style, file system).
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: log.txt (optional)
+      description: From your UsbRecovery folder. Review it for private names first.
+      render: text
