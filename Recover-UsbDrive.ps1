@@ -5,14 +5,18 @@
 .DESCRIPTION
   Never writes to the USB drive. Everything after step 2 works on a sector-by-sector copy:
     1. Diagnose - show what Windows sees (size, partitions, file system).
-    2. Image    - copy every sector to <OutDir>\usb.vhd. Unreadable sectors are zero-filled and
-                  listed in bad-sectors.txt. If the drive drops out, rerun the script: it resumes.
+    2. Image    - copy every sector to <OutDir>\usb.vhd in two passes, like GNU ddrescue: first
+                  everything that reads cleanly (damaged areas are skipped to spare a dying drive),
+                  then the damaged areas piece by piece. Unreadable sectors are zero-filled and listed
+                  in bad-sectors.txt. If the drive drops out, rerun the script: it resumes.
     3. Repair   - restore the copy's boot sector from the backup every FAT32 / exFAT / NTFS volume
                   keeps (the usual cause of "RAW" / "corrupted and unreadable").
     4. Copy out - mount the copy, run chkdsk on the COPY if files fail, and copy everything to
                   <OutDir>\files with original names and folders.
     5. Carve    - optional PhotoRec deep scan into <OutDir>\carved: finds photos, documents, videos,
                   archives... by their content even when the file system is gone (names are lost).
+                  Results are sorted into one folder per file type; photos get their date taken
+                  in front of their name.
 
   Run from an Administrator PowerShell:
     powershell -ExecutionPolicy Bypass -File .\Recover-UsbDrive.ps1
@@ -28,6 +32,7 @@
 [CmdletBinding()]
 param([int]$DiskNumber = -1, [string]$OutDir, [switch]$SkipCarve)
 $ErrorActionPreference = 'Stop'
+$Version = '1.1.0'
 
 $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -111,52 +116,90 @@ function Read-Into($src, $buf, [long]$pos, [int]$o, [int]$len) {
     } catch { $script:lastReadError = $_.Exception.Message; $false }
 }
 
+# Two passes, like GNU ddrescue. Pass 1 copies everything that reads cleanly and skips damaged areas,
+# skipping further each time it hits more damage, to spare a dying drive. Pass 2 goes back and scrapes
+# the skipped areas piece by piece. Progress is kept in <image>.map, so any rerun resumes.
 function Copy-Disk([int]$num, [long]$size, [int]$ss, [string]$img, [string]$log) {
     $chunk = 1MB
+    $map = "$img.map"   # "skip <offset>" = 1 MB left for pass 2; "done <offset>" = pass 2 finished it
+    $pending = New-Object 'System.Collections.Generic.SortedSet[long]'
+    if (Test-Path $map) {
+        foreach ($l in Get-Content $map) { $k, $v = $l -split ' '; if ($k -eq 'skip') { [void]$pending.Add([long]$v) } elseif ($k -eq 'done') { [void]$pending.Remove([long]$v) } }
+    }
     $have = if (Test-Path $img) { (Get-Item $img).Length } else { 0L }
-    if ($have -eq $size + 512) { Write-Host "Image already complete: $img"; return }
+    if ($have -eq $size + 512 -and $pending.Count -eq 0) { Write-Host "Image already complete: $img"; return }
     if (-not ('RawDisk' -as [type])) { Add-Type -TypeDefinition $rawDiskCs }
     $src = [IO.FileStream]::new([RawDisk]::OpenRead("\\.\PhysicalDrive$num"), [IO.FileAccess]::Read, 1)
     $dst = [IO.FileStream]::new($img, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write)
+    $buf = New-Object byte[] $chunk
+    $probe = New-Object byte[] $ss
+    $lastGood = -1L
+    $alive = { $lastGood -lt 0 -or (Read-Into $src $probe $lastGood 0 $ss) }   # can we still read a sector that worked before?
+    $dropped = 'The drive stopped responding at {0} MB. Unplug it, wait 10 seconds, plug it into a different port and run the script again - it resumes from here.'
     try {
-        $pos = [math]::Min([long][math]::Floor($have / $chunk) * $chunk, $size)
-        if ($pos -gt 0) { Write-Host "Resuming at $([math]::Round($pos / 1MB)) MB" }
-        $dst.SetLength($pos); $dst.Position = $pos
-        $buf = New-Object byte[] $chunk
-        $bad = 0; $dead = 0; $retried = 0; $i = 0; $start = $pos; $t = [Diagnostics.Stopwatch]::StartNew()
-        while ($pos -lt $size) {
-            $n = [int][math]::Min([long]$chunk, $size - $pos)   # [long] or PowerShell picks Min(int,int) and overflows on drives > 2 GB
-            if (Read-Into $src $buf $pos 0 $n) { $dead = 0 }
-            else {
-                if (++$retried -eq 1) { Write-Warning "Read error at $([math]::Round($pos / 1MB)) MB ($script:lastReadError) - retrying that part in smaller pieces." }
-                # Retry this 1 MB in 64 KB pieces, and only failing pieces sector by sector; zero-fill what can't be read.
-                [Array]::Clear($buf, 0, $n); $good = 0
-                for ($o = 0; $o -lt $n; $o += 64KB) {
-                    $m = [math]::Min(64KB, $n - $o)
-                    if (Read-Into $src $buf $pos $o $m) { $good++; continue }
-                    for ($s = $o; $s -lt $o + $m; $s += $ss) {
-                        if (Read-Into $src $buf $pos $s $ss) { $good++; continue }
-                        [Array]::Clear($buf, $s, $ss); $bad++
-                        Add-Content $log ('sector {0} (byte offset {1})' -f (($pos + $s) / $ss), ($pos + $s))
+        if ($have -lt $size + 512) {
+            $pos = [math]::Min([long][math]::Floor($have / $chunk) * $chunk, $size)
+            if ($pos -gt 0) { Write-Host "Resuming at $([math]::Round($pos / 1MB)) MB" }
+            $dst.SetLength($pos); $dst.Position = $pos
+            $skip = 1; $i = 0; $start = $pos; $t = [Diagnostics.Stopwatch]::StartNew()
+            while ($pos -lt $size) {
+                $n = [int][math]::Min([long]$chunk, $size - $pos)   # [long] or PowerShell picks Min(int,int) and overflows on drives > 2 GB
+                if (Read-Into $src $buf $pos 0 $n) {
+                    $dst.Write($buf, 0, $n); $lastGood = $pos; $pos += $n; $skip = 1
+                } else {
+                    if (-not (& $alive)) { $dst.SetLength($pos); throw ($dropped -f [math]::Round($pos / 1MB)) }
+                    if ($pending.Count -eq 0) { Write-Warning "Damaged area at $([math]::Round($pos / 1MB)) MB ($script:lastReadError). Skipping it for now - damaged areas are retried at the end." }
+                    # Leave this 1 MB plus the next ($skip - 1) MB for pass 2; skip twice as far next time (max 64 MB).
+                    $end = [math]::Min($pos + [long]$skip * $chunk, $size)
+                    [Array]::Clear($buf, 0, $chunk)
+                    while ($pos -lt $end) {
+                        $n = [int][math]::Min([long]$chunk, $end - $pos)
+                        Add-Content $map "skip $pos"   # map first, so a crash can never lose a skipped area
+                        [void]$pending.Add($pos); $dst.Write($buf, 0, $n); $pos += $n
+                    }
+                    $skip = [math]::Min($skip * 2, 64)
+                }
+                if ((++$i % 32) -eq 0) {
+                    $mbs = ($pos - $start) / 1MB / [math]::Max($t.Elapsed.TotalSeconds, 1)
+                    Write-Progress -Activity 'Pass 1: copying everything that reads cleanly' -PercentComplete ([int](100 * $pos / $size)) `
+                        -Status ('{0:N0} / {1:N0} MB   {2:N1} MB/s   damaged MB left for pass 2: {3}' -f ($pos / 1MB), ($size / 1MB), $mbs, $pending.Count)
+                }
+            }
+            $footer = New-VhdFooter $size
+            $dst.Write($footer, 0, 512)
+            Write-Progress -Activity 'Pass 1: copying everything that reads cleanly' -Completed
+        }
+        if ($pending.Count) {
+            $todo = @($pending); $j = 0; $bad = 0; $dead = 0
+            Write-Host "Pass 2: retrying $($todo.Count) MB of damaged areas piece by piece (this part can be slow)..."
+            foreach ($off in $todo) {
+                $n = [int][math]::Min([long]$chunk, $size - $off)
+                $good = 0; $badHere = @()
+                if (Read-Into $src $buf $off 0 $n) { $good = 1; $lastGood = $off }
+                else {
+                    # 64 KB pieces first, then only the failing pieces sector by sector; zero-fill what can't be read.
+                    [Array]::Clear($buf, 0, $n)
+                    for ($o = 0; $o -lt $n; $o += 64KB) {
+                        $m = [math]::Min(64KB, $n - $o)
+                        if (Read-Into $src $buf $off $o $m) { $good++; continue }
+                        for ($s = $o; $s -lt $o + $m; $s += $ss) {
+                            if (Read-Into $src $buf $off $s $ss) { $good++; continue }
+                            [Array]::Clear($buf, $s, $ss); $badHere += $s
+                        }
                     }
                 }
-                if ($good) { $dead = 0 }
-                elseif (++$dead -ge 32) {
-                    # 32 MB in a row unreadable: the drive has most likely dropped off the bus.
-                    $dst.SetLength($pos - ($dead - 1) * $chunk)   # so a rerun retries this stretch
-                    throw "The drive stopped responding at $([math]::Round($pos / 1MB)) MB. Unplug it, wait 10 seconds, plug it into a different port and run the script again - it resumes from here."
-                }
+                # A failure may just mean the drive dropped out mid-way: never save zeros unless it still responds.
+                if ($badHere -and -not (& $alive)) { throw ($dropped -f [math]::Round($off / 1MB)) }
+                if ($good) { $dead = 0 } elseif (++$dead -ge 32 -and $lastGood -lt 0) { throw ($dropped -f [math]::Round($off / 1MB)) }
+                foreach ($s in $badHere) { $bad++; Add-Content $log ('sector {0} (byte offset {1})' -f (($off + $s) / $ss), ($off + $s)) }
+                $dst.Position = $off; $dst.Write($buf, 0, $n); $dst.Flush()
+                Add-Content $map "done $off"   # only after the data is on disk
+                Write-Progress -Activity 'Pass 2: scraping damaged areas' -PercentComplete ([int](100 * ++$j / $todo.Count)) `
+                    -Status ('{0} / {1} MB   unreadable sectors: {2}' -f $j, $todo.Count, $bad)
             }
-            $dst.Write($buf, 0, $n); $pos += $n
-            if ((++$i % 32) -eq 0) {
-                $mbs = ($pos - $start) / 1MB / [math]::Max($t.Elapsed.TotalSeconds, 1)
-                Write-Progress -Activity 'Imaging USB drive (read-only)' -PercentComplete ([int](100 * $pos / $size)) `
-                    -Status ('{0:N0} / {1:N0} MB   {2:N1} MB/s   MB needing retries: {3}   unreadable sectors: {4}' -f ($pos / 1MB), ($size / 1MB), $mbs, $retried, $bad)
-            }
+            Write-Progress -Activity 'Pass 2: scraping damaged areas' -Completed
         }
-        $footer = New-VhdFooter $size
-        $dst.Write($footer, 0, 512)
-        Write-Progress -Activity 'Imaging USB drive (read-only)' -Completed
+        $bad = if (Test-Path $log) { @(Get-Content $log).Count } else { 0 }
         if ($bad) { Write-Warning "$bad unreadable sectors were zero-filled (list: $log). Files touching them may be partly damaged." }
         else { Write-Host 'Every sector read fine - the drive hardware looks OK, only the file system is damaged.' -ForegroundColor Green }
     } finally { $src.Dispose(); $dst.Dispose() }
@@ -190,6 +233,20 @@ function Copy-Out([string]$from, [string]$to, [string]$log) {
     $LASTEXITCODE   # 0-7 = fine, 8+ = some files failed
 }
 
+# "2023-05-14 18.22.31" from a photo's EXIF date taken, or $null.
+function Get-PhotoDate([string]$path) {
+    try {
+        $s = [IO.File]::OpenRead($path)
+        try {
+            $im = [Drawing.Image]::FromStream($s, $false, $false)   # no validation: only the metadata is read
+            try {
+                $raw = [Text.Encoding]::ASCII.GetString($im.GetPropertyItem(0x9003).Value).Trim([char]0)
+                [datetime]::ParseExact($raw, 'yyyy:MM:dd HH:mm:ss', $null).ToString('yyyy-MM-dd HH.mm.ss')
+            } finally { $im.Dispose() }
+        } finally { $s.Dispose() }
+    } catch { $null }
+}
+
 function Get-TestDisk([string]$dir) {
     $find = { Get-ChildItem $dir -Recurse -Filter photorec_win.exe -ErrorAction SilentlyContinue | Select-Object -First 1 }
     $exe = & $find
@@ -208,6 +265,7 @@ function Get-TestDisk([string]$dir) {
 }
 
 # ---------------------------------------------------------------------------------------------
+Write-Host "usb-rescue $Version - https://github.com/YousefYGhanem/usb-rescue"
 Step '1/5 Diagnose'
 if ($DiskNumber -lt 0) {
     $usb = @(Get-Disk | Where-Object BusType -eq 'USB')
@@ -305,14 +363,20 @@ if (-not $SkipCarve) {
             Push-Location $OutDir
             try { & (Join-Path $td 'photorec_win.exe') /log /d (Join-Path $carve 'recup') /cmd $img 'partition_none,fileopt,everything,enable,search' }
             finally { Pop-Location }
-            $n = @(Get-ChildItem $carve -Recurse -File -Exclude report.xml -ErrorAction SilentlyContinue).Count
-            # Sort into one folder per file type (jpg, docx, mp4...) - PhotoRec names are unique, so no clashes.
-            foreach ($f in @(Get-ChildItem $carve -Recurse -File -Exclude report.xml)) {
+            $new = @(Get-ChildItem $carve -Directory -Filter 'recup.*' | Get-ChildItem -File | Where-Object Name -ne 'report.xml')
+            $n = $new.Count
+            # Sort new PhotoRec output into one folder per file type (jpg, docx, mp4...), and put the date
+            # taken in front of photo names. PhotoRec names are unique, so nothing clashes.
+            Add-Type -AssemblyName System.Drawing
+            foreach ($f in $new) {
                 $ext = if ($f.Extension) { $f.Extension.TrimStart('.').ToLower() } else { 'no-extension' }
                 $d = Join-Path $carve $ext
                 New-Item -ItemType Directory -Force $d | Out-Null
-                Move-Item -LiteralPath $f.FullName -Destination $d
+                $name = $f.Name
+                if ($ext -in 'jpg', 'jpeg') { $taken = Get-PhotoDate $f.FullName; if ($taken) { $name = "$taken $name" } }
+                Move-Item -LiteralPath $f.FullName -Destination (Join-Path $d $name)
             }
+            Get-ChildItem $carve -Directory -Filter 'recup.*' | Where-Object { -not (Get-ChildItem $_.FullName -File | Where-Object Name -ne 'report.xml') } | Remove-Item -Recurse
             Write-Host "PhotoRec recovered $n files into $carve, sorted into one folder per file type" -ForegroundColor Green
         }
     }
