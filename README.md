@@ -41,7 +41,7 @@ You need free space of about **twice the USB drive's size** on another drive. Re
 |---|---|---|
 | 1. Diagnose | Shows the drive's size, partitions and file system | A drive reporting 0 bytes has a dead controller. Only a recovery lab can help, so the script stops |
 | 2. Image | Copies the drive into `usb.vhd` in two passes, like [GNU ddrescue](https://www.gnu.org/software/ddrescue/manual/ddrescue_manual.html). **Pass 1** copies everything that reads cleanly and skips damaged areas, skipping further (up to 64 MB) each time it hits more damage. **Pass 2** goes back and scrapes the damaged areas in 64 KB pieces, then sector by sector | Gets the healthy data off first, before a dying drive gets worse |
-| 3. Repair | Restores the copy's boot sector from the backup each file system keeps: FAT32 sectors 6-8, exFAT sectors 12-23, NTFS last sector | A damaged boot sector is the usual reason Windows says "RAW" |
+| 3. Repair | If the partition table is gone, finds the file system's boot sector (or its backup) near the start or end of the copy and rebuilds the table. Then restores the copy's boot sector from the backup each file system keeps: FAT32 sectors 6-8, exFAT sectors 12-23, NTFS last sector | A damaged boot sector is the usual reason Windows says "RAW" |
 | 4. Copy out | Mounts the copy as a virtual disk, copies files with `robocopy`, and if some fail runs `chkdsk /f` **on the copy** and tries again | Gets files back with their names and folders |
 | 5. Deep scan (optional) | Downloads [PhotoRec](https://www.cgsecurity.org/wiki/PhotoRec) and scans the copy for photos, documents, videos and archives by their content | Works even when the file system is completely gone |
 
@@ -58,7 +58,7 @@ If a partition is still unreadable at the end, the script prints how to run **Te
 Run from an Administrator PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Recover-UsbDrive.ps1 [-DiskNumber 2] [-OutDir D:\UsbRecovery] [-SkipCarve]
+powershell -ExecutionPolicy Bypass -File .\Recover-UsbDrive.ps1 [-DiskNumber 2] [-OutDir D:\UsbRecovery] [-SkipCarve] [-Yes]
 ```
 
 | Option | Meaning |
@@ -66,6 +66,7 @@ powershell -ExecutionPolicy Bypass -File .\Recover-UsbDrive.ps1 [-DiskNumber 2] 
 | `-DiskNumber` | The drive's number in Disk Management. Asked for if more than one USB drive is plugged in |
 | `-OutDir` | Where to save results. Must be on another drive |
 | `-SkipCarve` | Don't offer the PhotoRec deep scan |
+| `-Yes` | No prompts: take the default answer everywhere (for automation). Needs `-DiskNumber` if several USB disks are plugged in |
 
 ## Troubleshooting
 
@@ -89,7 +90,7 @@ Cheap "Generic Flash Disk" sticks often **report more capacity than they really 
 
 Every push is checked by [CI](https://github.com/YousefYGhanem/usb-rescue/actions/workflows/ci.yml):
 
-- **Windows end-to-end test:** builds FAT32, exFAT and NTFS virtual disks, wipes their boot sectors, then images, repairs and mounts them with the script's own code, and checks the file comes back intact.
+- **Windows end-to-end test:** builds FAT32, exFAT and NTFS virtual disks, wipes their boot sectors (and, in a second round, their partition tables too), then images, repairs and mounts them with the script's own code, and checks the file comes back intact. It also runs the **whole program unattended** (`-Yes`) on the worst case.
 - **Lint:** parse check, ASCII check and PSScriptAnalyzer.
 - **Model tests:** boot-sector repair on real file-system images, and two-pass imaging with bad sectors and drive dropouts.
 - **Download check:** confirms the PhotoRec download still matches the pinned SHA256 (also runs weekly).

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0 - 2026-11-02
+
+### Added
+- **Rebuilds a destroyed partition table** on the copy. When Windows sees no partitions at all, the script searches the first and last 64 MB for a FAT/exFAT/NTFS boot sector or its backup, works out where the partition started from the sector's own fields, and writes a new partition table into the copy. Previously this case needed manual TestDisk steps.
+- `-Yes` option: runs with no prompts, taking the default answer everywhere (for automation).
+- CI now runs the whole program unattended on a disk whose partition table and boot sector are both wiped, and tests partition-table rebuilding on FAT32, exFAT and NTFS.
+
 ## 1.1.1 - 2026-11-02
 
 ### Security

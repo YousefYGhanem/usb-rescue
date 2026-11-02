@@ -37,44 +37,76 @@ New-Item -ItemType Directory -Force $work | Out-Null
 $size = 512MB
 $data = New-Object byte[] 3MB; (New-Object Random 1).NextBytes($data)
 $fails = 0
-foreach ($fsType in 'FAT32', 'exFAT', 'NTFS') {
-    $src = "$work\usb-$fsType.vhd"; $out = "$work\copy-$fsType.vhd"
-    try {
-        # A blank disk built with the script's own VHD footer (also proves Windows accepts the footer).
-        $fs = [IO.File]::Create($src); $fs.SetLength($size); $fs.Position = $size; $fs.Write((New-VhdFooter $size), 0, 512); $fs.Dispose()
-        $disk = Mount-DiskImage -ImagePath $src -PassThru | Get-Disk
-        Initialize-Disk -Number $disk.Number -PartitionStyle MBR
-        $p = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter
-        Format-Volume -Partition $p -FileSystem $fsType -Confirm:$false | Out-Null
-        $p = Get-Partition -DiskNumber $disk.Number -PartitionNumber $p.PartitionNumber
-        [IO.File]::WriteAllBytes("$($p.DriveLetter):\photo.bin", $data)
-        $off = [long]$p.Offset; $psize = [long]$p.Size
-        Dismount-DiskImage -ImagePath $src | Out-Null
+# Build a 512 MB disk with one partition holding photo.bin, then break it. Returns the partition layout.
+function New-BrokenDisk([string]$path, [string]$fsType, [switch]$WipeMbr) {
+    # A blank disk built with the script's own VHD footer (also proves Windows accepts the footer).
+    $fs = [IO.File]::Create($path); $fs.SetLength($size); $fs.Position = $size; $fs.Write((New-VhdFooter $size), 0, 512); $fs.Dispose()
+    $disk = Mount-DiskImage -ImagePath $path -PassThru | Get-Disk
+    Initialize-Disk -Number $disk.Number -PartitionStyle MBR
+    $p = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter
+    Format-Volume -Partition $p -FileSystem $fsType -Confirm:$false | Out-Null
+    $p = Get-Partition -DiskNumber $disk.Number -PartitionNumber $p.PartitionNumber
+    [IO.File]::WriteAllBytes("$($p.DriveLetter):\photo.bin", $data)
+    $layout = [pscustomobject]@{ Offset = [long]$p.Offset; Size = [long]$p.Size }
+    Dismount-DiskImage -ImagePath $path | Out-Null
+    # Break it like the real drive: wipe the partition's boot sector (and maybe the partition table too).
+    $fs = [IO.File]::OpenWrite($path)
+    $fs.Position = $layout.Offset; $fs.Write((New-Object byte[] 512), 0, 512)
+    if ($WipeMbr) { $fs.Position = 0; $fs.Write((New-Object byte[] 512), 0, 512) }
+    $fs.Dispose()
+    $layout
+}
 
-        # Break it like the real drive: wipe the partition's boot sector.
-        $fs = [IO.File]::OpenWrite($src); $fs.Position = $off; $fs.Write((New-Object byte[] 512), 0, 512); $fs.Dispose()
+$cases = foreach ($t in 'FAT32', 'exFAT', 'NTFS') { @{ Fs = $t; WipeMbr = $false }; @{ Fs = $t; WipeMbr = $true } }
+foreach ($case in $cases) {
+    $fsType = $case.Fs; $name = if ($case.WipeMbr) { "$fsType, partition table also wiped" } else { $fsType }
+    $src = "$work\usb-$fsType-$($case.WipeMbr).vhd"; $out = "$work\copy-$fsType-$($case.WipeMbr).vhd"
+    try {
+        $layout = New-BrokenDisk $src $fsType -WipeMbr:$case.WipeMbr
 
         # Image the broken disk through \\.\PhysicalDriveN, exactly as from a USB drive.
         $disk = Mount-DiskImage -ImagePath $src -Access ReadOnly -PassThru | Get-Disk
-        Copy-Disk $disk.Number ([long]$disk.Size) 512 $out "$work\bad-$fsType.txt"
+        Copy-Disk $disk.Number ([long]$disk.Size) 512 $out "$work\bad-$fsType-$($case.WipeMbr).txt"
         Dismount-DiskImage -ImagePath $src | Out-Null
         Assert-SameBytes $src $out $size
         if ((Get-Item $out).Length -ne $size + 512) { throw 'image has the wrong length' }
 
-        Repair-BootSectors $out @([pscustomobject]@{ Offset = $off; Size = $psize }) 512
+        if ($case.WipeMbr) {
+            $found = Find-LostPartition $out $size 512
+            if (-not $found -or $found.Offset -ne $layout.Offset) { throw "lost partition not found (got offset $($found.Offset), want $($layout.Offset))" }
+            Write-Mbr $out $found 512
+            $layout = $found
+        }
+        Repair-BootSectors $out @($layout) 512
         $vd = Mount-DiskImage -ImagePath $out -PassThru | Get-Disk
         try {
             $L = Get-Letter $vd.Number
             $got = [IO.File]::ReadAllBytes("${L}:\photo.bin")
             if ([Convert]::ToBase64String($got) -ne [Convert]::ToBase64String($data)) { throw 'recovered file content differs' }
         } finally { Dismount-DiskImage -ImagePath $out | Out-Null }
-        Write-Host "$fsType : PASS (imaged, boot sector repaired, file recovered intact)"
+        Write-Host "$name : PASS (imaged, repaired, file recovered intact)"
     } catch {
         $fails++
-        Write-Host "::error::$fsType : FAIL - $_"
+        Write-Host "::error::$name : FAIL - $_"
         Get-DiskImage -ImagePath $src -ErrorAction SilentlyContinue | Where-Object Attached | Dismount-DiskImage | Out-Null
         Get-DiskImage -ImagePath $out -ErrorAction SilentlyContinue | Where-Object Attached | Dismount-DiskImage | Out-Null
     }
 }
+# The whole program, unattended, on the worst case: partition table and boot sector both wiped.
+$src = "$work\usb-full.vhd"; $outDir = "$work\UsbRecovery"
+try {
+    [void](New-BrokenDisk $src 'FAT32' -WipeMbr)
+    $disk = Mount-DiskImage -ImagePath $src -Access ReadOnly -PassThru | Get-Disk
+    & "$root\Recover-UsbDrive.ps1" -DiskNumber $disk.Number -OutDir $outDir -Yes -SkipCarve
+    $got = Get-ChildItem "$outDir\files" -Recurse -Filter photo.bin | Select-Object -First 1
+    if (-not $got) { throw 'photo.bin was not recovered' }
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($got.FullName)) -ne [Convert]::ToBase64String($data)) { throw 'recovered photo.bin differs' }
+    Write-Host 'Full program with -Yes : PASS (partition table rebuilt, file recovered with its name)'
+} catch {
+    $fails++; Write-Host "::error::Full program with -Yes : FAIL - $_"
+} finally {
+    Get-DiskImage -ImagePath $src -ErrorAction SilentlyContinue | Where-Object Attached | Dismount-DiskImage | Out-Null
+}
+
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 exit $fails

@@ -28,11 +28,14 @@
   twice the USB drive's size. Default: <internal drive with most free space>:\UsbRecovery
 .PARAMETER SkipCarve
   Don't offer the PhotoRec deep scan.
+.PARAMETER Yes
+  No prompts: take the default answer everywhere (for automation and tests). Needs -DiskNumber
+  if more than one USB disk is plugged in. Doesn't wait for you to unplug the drive.
 #>
 [CmdletBinding()]
-param([int]$DiskNumber = -1, [string]$OutDir, [switch]$SkipCarve)
+param([int]$DiskNumber = -1, [string]$OutDir, [switch]$SkipCarve, [switch]$Yes)
 $ErrorActionPreference = 'Stop'
-$Version = '1.1.1'
+$Version = '1.2.0'
 # SHA256 of testdisk-7.2.win64.zip. The download is refused if it doesn't match (it runs as Administrator).
 # CI re-checks this every week against the live download.
 $TestDiskSha256 = 'E97E203CE77B6B1A3A37D01BECCF069DC6C4632B579FFBB82AE739CDDA229F38'   # 27,354,549 bytes
@@ -68,15 +71,15 @@ function Read-At($fs, [long]$off, [int]$n) {
 }
 
 # Which file system a boot sector belongs to, or $null if it is damaged.
-function Get-BootFs([byte[]]$b) {
-    if ($b.Length -lt 512 -or $b[510] -ne 0x55 -or $b[511] -ne 0xAA) { return $null }
+function Get-BootFs([byte[]]$b, [int]$o = 0) {
+    if ($b.Length -lt $o + 512 -or $b[$o + 510] -ne 0x55 -or $b[$o + 511] -ne 0xAA) { return $null }
     $a = [Text.Encoding]::ASCII
-    if ($a.GetString($b, 3, 8) -eq 'EXFAT   ') { if ($b[108] -ge 9 -and $b[108] -le 12) { return 'exFAT' }; return $null }
-    $bps = [BitConverter]::ToUInt16($b, 11)
-    if ($bps -notin 512, 1024, 2048, 4096 -or $b[13] -eq 0) { return $null }
-    if ($a.GetString($b, 3, 8) -eq 'NTFS    ') { return 'NTFS' }
-    if ($a.GetString($b, 82, 5) -eq 'FAT32') { return 'FAT32' }
-    if ($a.GetString($b, 54, 3) -eq 'FAT') { return 'FAT' }
+    if ($a.GetString($b, $o + 3, 8) -eq 'EXFAT   ') { if ($b[$o + 108] -ge 9 -and $b[$o + 108] -le 12) { return 'exFAT' }; return $null }
+    $bps = [BitConverter]::ToUInt16($b, $o + 11)
+    if ($bps -notin 512, 1024, 2048, 4096 -or $b[$o + 13] -eq 0) { return $null }
+    if ($a.GetString($b, $o + 3, 8) -eq 'NTFS    ') { return 'NTFS' }
+    if ($a.GetString($b, $o + 82, 5) -eq 'FAT32') { return 'FAT32' }
+    if ($a.GetString($b, $o + 54, 3) -eq 'FAT') { return 'FAT' }
     $null
 }
 
@@ -208,6 +211,53 @@ function Copy-Disk([int]$num, [long]$size, [int]$ss, [string]$img, [string]$log)
     } finally { $src.Dispose(); $dst.Dispose() }
 }
 
+# For a drive whose partition table is gone: find a file system's boot sector, or its backup, in the
+# first or last 64 MB of the copy and work out where its partition began from the sector's own fields.
+# shortcut: finds one partition (USB sticks almost always have one); for more, TestDisk is suggested at the end.
+function Find-LostPartition([string]$img, [long]$size, [int]$ss) {
+    $fs = [IO.File]::OpenRead($img)
+    try {
+        $win = [long]64MB; $total = [long]($size / $ss)
+        foreach ($base in @(0L, [math]::Max(0L, $size - $win))) {
+            for ($p = $base; $p -lt [math]::Min($base + $win, $size); $p += 1MB) {
+                $b = Read-At $fs $p 1MB
+                for ($o = 0; $o -lt $b.Length; $o += $ss) {
+                    if ($b[$o + 510] -ne 0x55) { continue }   # quick filter before the full check
+                    $t = Get-BootFs $b $o
+                    if (-not $t) { continue }
+                    $x = [long](($p + $o) / $ss)   # sector holding this boot sector
+                    if ($t -eq 'exFAT') { $start = [BitConverter]::ToInt64($b, $o + 64); $len = [BitConverter]::ToInt64($b, $o + 72); $back = 12 }
+                    elseif ($t -eq 'NTFS') { $start = [long][BitConverter]::ToUInt32($b, $o + 28); $len = [BitConverter]::ToInt64($b, $o + 40) + 1; $back = $len - 1 }
+                    else {
+                        $start = [long][BitConverter]::ToUInt32($b, $o + 28)
+                        $len = [long][BitConverter]::ToUInt16($b, $o + 19); if (-not $len) { $len = [long][BitConverter]::ToUInt32($b, $o + 32) }
+                        $back = if ($t -eq 'FAT32') { 6 } else { 0 }
+                    }
+                    if (-not $start) { $start = $x }   # "partition start" field not set: take this as the primary
+                    if (($x -eq $start -or $x -eq $start + $back) -and $len -gt 0 -and $start + $len -le $total) {
+                        return [pscustomobject]@{ Offset = $start * $ss; Size = $len * $ss; FileSystem = $t }
+                    }
+                }
+            }
+        }
+    } finally { $fs.Dispose() }
+    $null
+}
+
+# Write a one-partition MBR into the copy so Windows can mount the partition found above.
+function Write-Mbr([string]$img, $part, [int]$ss) {
+    $m = New-Object byte[] 512
+    [BitConverter]::GetBytes([uint32](Get-Random -Minimum 1 -Maximum ([int]::MaxValue))).CopyTo($m, 440)   # new disk signature
+    $m[447] = 0xFE; $m[448] = 0xFF; $m[449] = 0xFF   # CHS start/end unused: "use LBA"
+    $m[450] = switch ($part.FileSystem) { 'FAT32' { 0x0C } 'FAT' { 0x0E } default { 0x07 } }
+    $m[451] = 0xFE; $m[452] = 0xFF; $m[453] = 0xFF
+    [BitConverter]::GetBytes([uint32]($part.Offset / $ss)).CopyTo($m, 454)
+    [BitConverter]::GetBytes([uint32]($part.Size / $ss)).CopyTo($m, 458)
+    $m[510] = 0x55; $m[511] = 0xAA
+    $fs = [IO.FileStream]::new($img, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
+    try { $fs.Write($m, 0, 512) } finally { $fs.Dispose() }
+}
+
 function Repair-BootSectors([string]$img, $layout, [int]$ss) {
     $fs = [IO.FileStream]::new($img, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
     try {
@@ -276,7 +326,7 @@ if ($DiskNumber -lt 0) {
     $usb = @(Get-Disk | Where-Object BusType -eq 'USB')
     if (-not $usb) { throw 'No USB disk found. Try another port (back of the PC) or cable, then check Disk Management.' }
     $usb | Format-Table Number, FriendlyName, @{n = 'SizeGB'; e = { [math]::Round($_.Size / 1GB, 2) } }, PartitionStyle, OperationalStatus -AutoSize | Out-Host
-    $DiskNumber = if ($usb.Count -eq 1) { $usb[0].Number } else { [int](Read-Host 'Disk number of the broken USB drive') }
+    $DiskNumber = if ($usb.Count -eq 1) { $usb[0].Number } elseif ($Yes) { throw 'Several USB disks are plugged in: pass -DiskNumber.' } else { [int](Read-Host 'Disk number of the broken USB drive') }
 }
 $disk = Get-Disk -Number $DiskNumber
 if ($disk.IsBoot -or $disk.IsSystem) { throw "Disk $DiskNumber is your Windows disk, not the USB drive." }
@@ -312,13 +362,22 @@ Step '2/5 Image the drive (read-only)'
 Copy-Disk $DiskNumber $size $ss $img (Join-Path $OutDir 'bad-sectors.txt')
 
 Step '3/5 Repair boot sectors on the copy'
-$layout = if ($parts) { $parts } else { , [pscustomobject]@{ Offset = 0L; Size = $size } }
+$layout = $parts
+if (-not $parts) {
+    $lost = Find-LostPartition $img $size $ss
+    if ($lost -and $lost.Offset -gt 0) {
+        Write-Host ('Partition table was destroyed - found a {0} partition at {1:N0} MB and rebuilt the table on the copy.' -f $lost.FileSystem, ($lost.Offset / 1MB)) -ForegroundColor Green
+        Write-Mbr $img $lost $ss
+        $layout = @($lost)
+    } elseif ($lost) { $layout = @($lost) }   # file system starts at sector 0: no partition table needed
+    else { Write-Warning 'No file system found near the start or end of the drive.'; $layout = @([pscustomobject]@{ Offset = 0L; Size = $size }) }
+}
 Repair-BootSectors $img $layout $ss
 
 Step '4/5 Mount the copy and copy files out'
 Write-Host 'Unplug the USB drive now - the rest works on the copy (this also avoids a disk-signature clash).' -ForegroundColor Yellow
 Write-Host 'If Windows pops up "You need to format the disk", click CANCEL.' -ForegroundColor Yellow
-Read-Host 'Press Enter when it is unplugged' | Out-Null
+if (-not $Yes) { Read-Host 'Press Enter when it is unplugged' | Out-Null }
 $filesDir = Join-Path $OutDir 'files'
 $rlog = Join-Path $OutDir 'robocopy.log'
 $failed = $false
@@ -358,7 +417,7 @@ $td = $null; $carve = $null
 if (-not $SkipCarve) {
     Step '5/5 Deep scan with PhotoRec (optional)'
     $def = if ($count -and -not $failed) { 'n' } else { 'y' }
-    $ans = Read-Host "Scan the whole copy for lost or deleted files by content? Names/folders are lost; can take hours. (y/n) [$def]"
+    $ans = if ($Yes) { $def } else { Read-Host "Scan the whole copy for lost or deleted files by content? Names/folders are lost; can take hours. (y/n) [$def]" }
     if (-not $ans) { $ans = $def }
     if ($ans -match '^y') {
         $td = Get-TestDisk (Join-Path $OutDir 'testdisk')
