@@ -366,7 +366,7 @@ $layout = $parts
 if (-not $parts) {
     $lost = Find-LostPartition $img $size $ss
     if ($lost -and $lost.Offset -gt 0) {
-        Write-Host ('Partition table was destroyed - found a {0} partition at {1:N0} MB and rebuilt the table on the copy.' -f $lost.FileSystem, ($lost.Offset / 1MB)) -ForegroundColor Green
+        Write-Host ('Partition table was destroyed - found a {0} partition at sector {1:N0} and rebuilt the table on the copy.' -f $lost.FileSystem, ($lost.Offset / $ss)) -ForegroundColor Green
         Write-Mbr $img $lost $ss
         $layout = @($lost)
     } elseif ($lost) { $layout = @($lost) }   # file system starts at sector 0: no partition table needed
