@@ -242,6 +242,7 @@ $need = $size + 512 - $(if (Test-Path $img) { (Get-Item $img).Length } else { 0 
 $free = (Get-PSDrive $OutDir.Substring(0, 1)).Free
 if ($free -lt $need) { throw ("Not enough space in {0}: need {1:N1} GB free for the image, have {2:N1} GB. Use -OutDir on a bigger drive." -f $OutDir, ($need / 1GB), ($free / 1GB)) }
 if ($free -lt $need + $size) { Write-Warning 'There may not be enough free space for both the image and the recovered files.' }
+Start-Transcript -Path (Join-Path $OutDir 'log.txt') -Append | Out-Null   # full log to share when asking for help
 Write-Host "Output folder: $OutDir"
 
 Step '2/5 Image the drive (read-only)'
@@ -305,7 +306,14 @@ if (-not $SkipCarve) {
             try { & (Join-Path $td 'photorec_win.exe') /log /d (Join-Path $carve 'recup') /cmd $img 'partition_none,fileopt,everything,enable,search' }
             finally { Pop-Location }
             $n = @(Get-ChildItem $carve -Recurse -File -Exclude report.xml -ErrorAction SilentlyContinue).Count
-            Write-Host "PhotoRec recovered $n files into $carve (recup.1, recup.2... folders)" -ForegroundColor Green
+            # Sort into one folder per file type (jpg, docx, mp4...) - PhotoRec names are unique, so no clashes.
+            foreach ($f in @(Get-ChildItem $carve -Recurse -File -Exclude report.xml)) {
+                $ext = if ($f.Extension) { $f.Extension.TrimStart('.').ToLower() } else { 'no-extension' }
+                $d = Join-Path $carve $ext
+                New-Item -ItemType Directory -Force $d | Out-Null
+                Move-Item -LiteralPath $f.FullName -Destination $d
+            }
+            Write-Host "PhotoRec recovered $n files into $carve, sorted into one folder per file type" -ForegroundColor Green
         }
     }
 }
@@ -315,7 +323,10 @@ Write-Host "Files with original names : $filesDir"
 if ($carve) { Write-Host "Files found by deep scan  : $carve" }
 Write-Host "Drive image               : $img"
 Write-Host '  Keep the image until you have checked your files, then delete it. You can reformat the USB drive after that'
-Write-Host '  (if it gets corrupted again soon, the drive is failing - replace it).'
+Write-Host '  Before trusting the drive again, test its real capacity with H2testw or f3: cheap "Generic Flash Disk" sticks often'
+Write-Host '  fake their size and silently overwrite old files once full - a classic cause of exactly this corruption.'
+Write-Host "  Full log of this run: $OutDir\log.txt"
+Stop-Transcript | Out-Null
 if ($failed) {
     $tdExe = if ($td) { Join-Path $td 'testdisk_win.exe' } else { "$OutDir\testdisk\...\testdisk_win.exe" }
     Write-Host "`nA partition was still unreadable. TestDisk can search the image for lost partitions and copy files out:" -ForegroundColor Yellow

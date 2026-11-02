@@ -17,8 +17,9 @@ Results go to `<drive with most free space>:\UsbRecovery` (you need free space o
 | Folder / file | What it is |
 |---|---|
 | `files\` | Files recovered with original names and folders |
-| `carved\recup.N\` | Files found by content (PhotoRec); names and folders are lost |
+| `carved\<type>\` | Files found by content (PhotoRec), one folder per type (`jpg`, `docx`, `mp4`...); names and folders are lost |
 | `usb.vhd` | The full copy of the drive. Delete it once you've checked your files |
+| `log.txt` | Full log of the run (attach it when asking for help) |
 | `bad-sectors.txt`, `robocopy.log` | What could not be read |
 
 Command-line options (from an Administrator PowerShell):
@@ -41,6 +42,10 @@ If a partition is still unreadable at the end, it prints how to run TestDisk on 
 
 A healthy stick reads at 10-30 MB/s. If it's around 1 MB/s, the stick is probably connected at USB 1.1 speed: press Ctrl+C, move it to a back port and run it again (it resumes). If "MB needing retries" keeps rising, the flash is failing; let it finish.
 
+## Before reusing the drive
+
+Cheap "Generic Flash Disk" sticks often report more capacity than they have. Once the real capacity is full they silently overwrite old data, which causes exactly this kind of corruption. After recovering your files, test the drive with [H2testw](https://www.heise.de/download/product/h2testw-50539) or [f3](https://github.com/AltraMayor/f3). Both tests erase the drive.
+
 ## Tests
 
 `tests/check_backups.py` (Linux; needs `dosfstools`, `exfatprogs`, `ntfs-3g`, `mtools`) builds real FAT32/exFAT/NTFS images, wipes their boot sectors, and checks that the script's repair rules make them readable again.
@@ -48,3 +53,7 @@ A healthy stick reads at 10-30 MB/s. If it's around 1 MB/s, the stick is probabl
 ## Requirements
 
 Windows 10/11, Windows PowerShell 5.1 (built in), Administrator rights. Internet access only for the optional PhotoRec download.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Uses [TestDisk/PhotoRec](https://www.cgsecurity.org/) (GPL), downloaded at run time and not bundled.
