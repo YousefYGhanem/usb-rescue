@@ -35,7 +35,7 @@ $ErrorActionPreference = 'Stop'
 $Version = '1.1.1'
 # SHA256 of testdisk-7.2.win64.zip. The download is refused if it doesn't match (it runs as Administrator).
 # CI re-checks this every week against the live download.
-$TestDiskSha256 = ''
+$TestDiskSha256 = 'E97E203CE77B6B1A3A37D01BECCF069DC6C4632B579FFBB82AE739CDDA229F38'   # 27,354,549 bytes
 
 $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
