@@ -74,6 +74,7 @@ async function refresh() {
   try {
     const r = await invoke('list_drives');
     S.drives = r.drives || [];
+    if (r.version) $('ver').textContent = 'USB Rescue ' + r.version;
     if (!S.outDir) { S.outDir = r.outDir || ''; S.outFree = r.outFree || 0; renderOut(); }
     if (!S.drives.some((d) => d.number === S.sel)) {
       const pick = S.drives.find((d) => !d.readable && d.size > 0) || S.drives[0];
