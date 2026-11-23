@@ -31,11 +31,21 @@
 .PARAMETER Yes
   No prompts: take the default answer everywhere (for automation and tests). Needs -DiskNumber
   if more than one USB disk is plugged in. Doesn't wait for you to unplug the drive.
+.PARAMETER Carve
+  Run the PhotoRec deep scan without asking.
+.PARAMETER Events
+  Also print progress as JSON lines starting with "@@" (used by the USB Rescue desktop app).
+.PARAMETER ListDrives
+  Print the USB drives and the default output folder as one "@@" JSON line, then exit.
 #>
 [CmdletBinding()]
-param([int]$DiskNumber = -1, [string]$OutDir, [switch]$SkipCarve, [switch]$Yes)
+param([int]$DiskNumber = -1, [string]$OutDir, [switch]$SkipCarve, [switch]$Yes, [switch]$Carve, [switch]$Events, [switch]$ListDrives)
 $ErrorActionPreference = 'Stop'
-$Version = '1.2.0'
+# One JSON line per event for the desktop app; does nothing without -Events.
+function Send-Event([hashtable]$e) { if ($Events) { [Console]::Out.WriteLine('@@' + (ConvertTo-Json $e -Compress -Depth 4)) } }
+if ($Events) { [Console]::OutputEncoding = [Text.Encoding]::UTF8 }
+trap { Send-Event @{ t = 'error'; msg = "$_" }; break }
+$Version = '1.3.0'
 # SHA256 of testdisk-7.2.win64.zip. The download is refused if it doesn't match (it runs as Administrator).
 # CI re-checks this every week against the live download.
 $TestDiskSha256 = 'E97E203CE77B6B1A3A37D01BECCF069DC6C4632B579FFBB82AE739CDDA229F38'   # 27,354,549 bytes
@@ -60,7 +70,7 @@ public static class RawDisk {
 }
 '@
 
-function Step($t) { Write-Host "`n=== $t ===" -ForegroundColor Cyan }
+function Step($t) { Write-Host "`n=== $t ===" -ForegroundColor Cyan; Send-Event @{ t = 'step'; name = $t } }
 
 function Read-At($fs, [long]$off, [int]$n) {
     $b = New-Object byte[] $n
@@ -147,7 +157,7 @@ function Copy-Disk([int]$num, [long]$size, [int]$ss, [string]$img, [string]$log)
             $pos = [math]::Min([long][math]::Floor($have / $chunk) * $chunk, $size)
             if ($pos -gt 0) { Write-Host "Resuming at $([math]::Round($pos / 1MB)) MB" }
             $dst.SetLength($pos); $dst.Position = $pos
-            $skip = 1; $i = 0; $start = $pos; $t = [Diagnostics.Stopwatch]::StartNew()
+            $skip = 1; $i = 0; $start = $pos; $t = [Diagnostics.Stopwatch]::StartNew(); $nextEvt = 0
             while ($pos -lt $size) {
                 $n = [int][math]::Min([long]$chunk, $size - $pos)   # [long] or PowerShell picks Min(int,int) and overflows on drives > 2 GB
                 if (Read-Into $src $buf $pos 0 $n) {
@@ -169,6 +179,10 @@ function Copy-Disk([int]$num, [long]$size, [int]$ss, [string]$img, [string]$log)
                     $mbs = ($pos - $start) / 1MB / [math]::Max($t.Elapsed.TotalSeconds, 1)
                     Write-Progress -Activity 'Pass 1: copying everything that reads cleanly' -PercentComplete ([int](100 * $pos / $size)) `
                         -Status ('{0:N0} / {1:N0} MB   {2:N1} MB/s   damaged MB left for pass 2: {3}' -f ($pos / 1MB), ($size / 1MB), $mbs, $pending.Count)
+                }
+                if ($Events -and $t.ElapsedMilliseconds -ge $nextEvt) {
+                    $nextEvt = $t.ElapsedMilliseconds + 400
+                    Send-Event @{ t = 'pass1'; pos = $pos; size = $size; mbs = [math]::Round(($pos - $start) / 1MB / [math]::Max($t.Elapsed.TotalSeconds, 1), 1); damagedMB = $pending.Count }
                 }
             }
             $footer = New-VhdFooter $size
@@ -202,10 +216,12 @@ function Copy-Disk([int]$num, [long]$size, [int]$ss, [string]$img, [string]$log)
                 Add-Content $map "done $off"   # only after the data is on disk
                 Write-Progress -Activity 'Pass 2: scraping damaged areas' -PercentComplete ([int](100 * ++$j / $todo.Count)) `
                     -Status ('{0} / {1} MB   unreadable sectors: {2}' -f $j, $todo.Count, $bad)
+                Send-Event @{ t = 'pass2'; done = $j; total = $todo.Count; bad = $bad }
             }
             Write-Progress -Activity 'Pass 2: scraping damaged areas' -Completed
         }
         $bad = if (Test-Path $log) { @(Get-Content $log).Count } else { 0 }
+        Send-Event @{ t = 'imaged'; badSectors = $bad }
         if ($bad) { Write-Warning "$bad unreadable sectors were zero-filled (list: $log). Files touching them may be partly damaged." }
         else { Write-Host 'Every sector read fine - the drive hardware looks OK, only the file system is damaged.' -ForegroundColor Green }
     } finally { $src.Dispose(); $dst.Dispose() }
@@ -300,6 +316,13 @@ function Get-PhotoDate([string]$path) {
     } catch { $null }
 }
 
+# The fixed (internal) drive with the most free space, skipping the given drive letters.
+function Get-DefaultOutDir([string[]]$exclude) {
+    $best = Get-Volume | Where-Object { $_.DriveType -eq 'Fixed' -and [string]$_.DriveLetter -match '[A-Z]' -and [string]$_.DriveLetter -notin $exclude } |
+        Sort-Object SizeRemaining -Descending | Select-Object -First 1
+    if ($best) { [pscustomobject]@{ Dir = "$($best.DriveLetter):\UsbRecovery"; Free = [long]$best.SizeRemaining } }
+}
+
 function Get-TestDisk([string]$dir) {
     $find = { Get-ChildItem $dir -Recurse -Filter photorec_win.exe -ErrorAction SilentlyContinue | Select-Object -First 1 }
     $exe = & $find
@@ -320,6 +343,21 @@ function Get-TestDisk([string]$dir) {
 }
 
 # ---------------------------------------------------------------------------------------------
+if ($ListDrives) {
+    $Events = $true; [Console]::OutputEncoding = [Text.Encoding]::UTF8
+    $letters = @(); $drives = @()
+    foreach ($d in @(Get-Disk | Where-Object BusType -eq 'USB')) {
+        $ps = @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue | Where-Object { $_.Type -notin 'Reserved', 'Extended' })
+        $fs = @($ps | ForEach-Object { [string]($_ | Get-Volume -ErrorAction SilentlyContinue).FileSystem })
+        $dl = @($ps | ForEach-Object { [string]$_.DriveLetter } | Where-Object { $_ -match '[A-Z]' })
+        $letters += $dl
+        $drives += @{ number = $d.Number; name = [string]$d.FriendlyName; size = [long]$d.Size; letters = @($dl)
+            readable = [bool]($ps.Count -and -not @($fs | Where-Object { -not $_ -or $_ -eq 'RAW' }).Count) }
+    }
+    $def = Get-DefaultOutDir $letters
+    Send-Event @{ t = 'drives'; version = $Version; drives = @($drives); outDir = $def.Dir; outFree = $def.Free }
+    return
+}
 Write-Host "usb-rescue $Version - https://github.com/YousefYGhanem/usb-rescue"
 Step '1/5 Diagnose'
 if ($DiskNumber -lt 0) {
@@ -342,11 +380,7 @@ foreach ($p in $parts) {
 if (-not $parts) { Write-Warning 'No partitions visible - the partition table itself is damaged. Imaging anyway; see the TestDisk tip at the end.' }
 
 $usbLetters = @($parts | ForEach-Object { [string]$_.DriveLetter } | Where-Object { $_ -match '[A-Z]' })
-if (-not $OutDir) {
-    $best = Get-Volume | Where-Object { $_.DriveType -eq 'Fixed' -and [string]$_.DriveLetter -match '[A-Z]' -and [string]$_.DriveLetter -notin $usbLetters } |
-        Sort-Object SizeRemaining -Descending | Select-Object -First 1
-    $OutDir = "$($best.DriveLetter):\UsbRecovery"
-}
+if (-not $OutDir) { $OutDir = (Get-DefaultOutDir $usbLetters).Dir }
 if ($OutDir -notmatch '^[A-Za-z]:\\') { throw 'OutDir must be a local path like D:\UsbRecovery' }
 if ([string]$OutDir[0] -in $usbLetters) { throw 'OutDir must NOT be on the USB drive you are recovering.' }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -357,6 +391,7 @@ if ($free -lt $need) { throw ("Not enough space in {0}: need {1:N1} GB free for 
 if ($free -lt $need + $size) { Write-Warning 'There may not be enough free space for both the image and the recovered files.' }
 Start-Transcript -Path (Join-Path $OutDir 'log.txt') -Append | Out-Null   # full log to share when asking for help
 Write-Host "Output folder: $OutDir"
+Send-Event @{ t = 'disk'; number = $DiskNumber; name = [string]$disk.FriendlyName; size = $size; partitions = $parts.Count; outDir = $OutDir }
 
 Step '2/5 Image the drive (read-only)'
 Copy-Disk $DiskNumber $size $ss $img (Join-Path $OutDir 'bad-sectors.txt')
@@ -410,14 +445,16 @@ try {
 } finally {
     Dismount-DiskImage -ImagePath $img | Out-Null
 }
-$count = @(Get-ChildItem $filesDir -Recurse -File -ErrorAction SilentlyContinue).Count
+$got = @(Get-ChildItem $filesDir -Recurse -File -ErrorAction SilentlyContinue)
+$count = $got.Count
 Write-Host "Recovered with names and folders: $count files in $filesDir" -ForegroundColor Green
+Send-Event @{ t = 'copied'; count = $count; bytes = [long]($got | Measure-Object Length -Sum).Sum; dir = $filesDir; failed = $failed }
 
 $td = $null; $carve = $null
 if (-not $SkipCarve) {
     Step '5/5 Deep scan with PhotoRec (optional)'
     $def = if ($count -and -not $failed) { 'n' } else { 'y' }
-    $ans = if ($Yes) { $def } else { Read-Host "Scan the whole copy for lost or deleted files by content? Names/folders are lost; can take hours. (y/n) [$def]" }
+    $ans = if ($Carve) { 'y' } elseif ($Yes) { $def } else { Read-Host "Scan the whole copy for lost or deleted files by content? Names/folders are lost; can take hours. (y/n) [$def]" }
     if (-not $ans) { $ans = $def }
     if ($ans -match '^y') {
         $td = Get-TestDisk (Join-Path $OutDir 'testdisk')
@@ -425,8 +462,12 @@ if (-not $SkipCarve) {
             $carve = Join-Path $OutDir 'carved'
             New-Item -ItemType Directory -Force $carve | Out-Null   # PhotoRec fails if the parent folder is missing
             Push-Location $OutDir
-            try { & (Join-Path $td 'photorec_win.exe') /log /d (Join-Path $carve 'recup') /cmd $img 'partition_none,fileopt,everything,enable,search' }
-            finally { Pop-Location }
+            $prArgs = @('/log', '/d', (Join-Path $carve 'recup'), '/cmd', $img, 'partition_none,fileopt,everything,enable,search')
+            try {
+                if ($Events) {   # the desktop app has no console for PhotoRec's screen: give it a hidden one
+                    Start-Process (Join-Path $td 'photorec_win.exe') -ArgumentList ($prArgs | ForEach-Object { "`"$_`"" }) -WorkingDirectory $OutDir -WindowStyle Hidden -Wait
+                } else { & (Join-Path $td 'photorec_win.exe') @prArgs }
+            } finally { Pop-Location }
             $new = @(Get-ChildItem $carve -Directory -Filter 'recup.*' | Get-ChildItem -File | Where-Object Name -ne 'report.xml')
             $n = $new.Count
             # Sort new PhotoRec output into one folder per file type (jpg, docx, mp4...), and put the date
@@ -442,6 +483,7 @@ if (-not $SkipCarve) {
             }
             Get-ChildItem $carve -Directory -Filter 'recup.*' | Where-Object { -not (Get-ChildItem $_.FullName -File | Where-Object Name -ne 'report.xml') } | Remove-Item -Recurse
             Write-Host "PhotoRec recovered $n files into $carve, sorted into one folder per file type" -ForegroundColor Green
+            Send-Event @{ t = 'carved'; count = $n; dir = $carve }
         }
     }
 }
@@ -455,6 +497,7 @@ Write-Host '  Before trusting the drive again, test its real capacity with H2tes
 Write-Host '  fake their size and silently overwrite old files once full - a classic cause of exactly this corruption.'
 Write-Host "  Full log of this run: $OutDir\log.txt"
 Stop-Transcript | Out-Null
+Send-Event @{ t = 'done'; files = $filesDir; carved = $carve; image = $img; outDir = $OutDir; failed = $failed }
 if ($failed) {
     $tdExe = if ($td) { Join-Path $td 'testdisk_win.exe' } else { "$OutDir\testdisk\...\testdisk_win.exe" }
     Write-Host "`nA partition was still unreadable. TestDisk can search the image for lost partitions and copy files out:" -ForegroundColor Yellow

@@ -1,0 +1,22 @@
+[package]
+name = "usb-rescue"
+version = "1.3.0"
+description = "Get your files back from a USB drive or SD card that Windows says is corrupted"
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde_json = "1"
+
+# Small single-file exe.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -1,0 +1,12 @@
+{
+  "name": "usb-rescue-app",
+  "private": true,
+  "version": "1.3.0",
+  "scripts": {
+    "tauri": "tauri",
+    "build": "tauri build --no-bundle"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -10,18 +10,24 @@ Use it when Windows shows one of these:
 - *"You need to format the disk in drive E: before you can use it."*
 - Disk Management lists the drive's file system as **RAW**.
 
-usb-rescue is a single PowerShell script for Windows 10/11. It needs nothing to install and **never writes to your drive**: it copies the drive sector by sector first, and does all repairs on the copy.
+usb-rescue is a portable app for Windows 10/11: one `.exe`, nothing to install. It **never writes to your drive**. It copies the drive sector by sector first and does all repairs on the copy.
 
 ---
 
 ## Quick start
 
-1. **Download** the ZIP from the [latest release](https://github.com/YousefYGhanem/usb-rescue/releases/latest), then unzip it.
-2. **Plug in the broken drive.** Plug in only that one USB drive, and use a port on the back of the PC.
-3. **Double-click `Recover-UsbDrive.bat`** and click **Yes** on the Administrator prompt.
-4. Follow the prompts. If Windows offers to **format** anything, click **Cancel**.
+1. **Download [`USB-Rescue.exe`](https://github.com/YousefYGhanem/usb-rescue/releases/latest/download/USB-Rescue.exe)** from the [latest release](https://github.com/YousefYGhanem/usb-rescue/releases/latest). It is one portable file: no installer, nothing left behind.
+2. **Plug in the broken drive**, using a port on the back of the PC.
+3. **Double-click `USB-Rescue.exe`** and click **Yes** on the Administrator prompt.
+4. **Choose the drive and press Rescue my files.** If Windows offers to **format** anything, click **Cancel**.
 
-You need free space of about **twice the USB drive's size** on another drive. Results go to `<drive with most free space>:\UsbRecovery`.
+The app shows each step in plain language: a safe copy of the drive, the repair, then your files. Press **Show my files** at the end. **Search deeper** finds photos, documents and videos by their content when the names are lost.
+
+You need free space of about **twice the USB drive's size** on another drive. Results go to `<drive with most free space>:\UsbRecovery`. Use **Change** to pick another place.
+
+> **"Windows protected your PC"?** The app is new and not code-signed yet, so SmartScreen may warn you. Click **More info**, then **Run anyway**. You can check the file against the SHA256 listed in the release notes first.
+
+**Prefer the command line?** Download `usb-rescue-script.zip` from the same release, unzip it, and double-click `Recover-UsbDrive.bat` (see [Options](#options)). The app and the script do exactly the same recovery: the app runs the script underneath.
 
 ## What you get
 
@@ -50,8 +56,8 @@ If a partition is still unreadable at the end, the script prints how to run **Te
 ### Safety
 
 - The USB drive is opened **read-only** (`GENERIC_READ`). Nothing in the script can write to it.
-- You can stop the script at any time (Ctrl+C) and run it again: imaging resumes from `usb.vhd.map`.
-- If the drive disconnects, the script stops and tells you to replug it. It checks that the drive still responds before saving any zeros, so a disconnect is never mistaken for bad sectors.
+- You can stop at any time (**Pause** in the app, or Ctrl+C in the script) and start again: imaging resumes from `usb.vhd.map`.
+- If the drive disconnects, the rescue stops and tells you to replug it. It checks that the drive still responds before saving any zeros, so a disconnect is never mistaken for bad sectors.
 
 ## Options
 
@@ -67,14 +73,20 @@ powershell -ExecutionPolicy Bypass -File .\Recover-UsbDrive.ps1 [-DiskNumber 2] 
 | `-OutDir` | Where to save results. Must be on another drive |
 | `-SkipCarve` | Don't offer the PhotoRec deep scan |
 | `-Yes` | No prompts: take the default answer everywhere (for automation). Needs `-DiskNumber` if several USB disks are plugged in |
+| `-Carve` | Run the PhotoRec deep scan without asking |
+| `-Events`, `-ListDrives` | Machine-readable progress and drive list, used by the desktop app |
 
 ## Troubleshooting
 
-**It's very slow (around 1 MB/s).** A healthy stick reads at 10-30 MB/s. About 1 MB/s usually means the drive is connected at USB 1.1 speed through a front port, hub or extension cable. Press Ctrl+C, move the drive to a back port and run the script again; it resumes. If "damaged MB left for pass 2" keeps rising, the flash is failing: let it finish.
+**The app doesn't open.** It needs the Microsoft Edge WebView2 runtime. This is built into Windows 11 and installed on nearly every up-to-date Windows 10 PC. If it's missing, [install WebView2](https://developer.microsoft.com/microsoft-edge/webview2/), or use the script from `usb-rescue-script.zip`.
 
-**"The drive stopped responding at ... MB".** Unplug the drive, wait 10 seconds, plug it into a different port and run the script again. It continues where it stopped.
+**It's very slow (around 1 MB/s).** A healthy stick reads at 10-30 MB/s. About 1 MB/s usually means the drive is connected at USB 1.1 speed through a front port, hub or extension cable. Press **Pause** (or Ctrl+C), move the drive to a back port and start again; it resumes. If the "Damaged" count keeps rising, the flash is failing: let it finish.
 
-**"Not enough space".** Use `-OutDir` to point at a drive with more free space, or an external hard drive.
+**"The drive stopped responding at ... MB".** Unplug the drive, wait 10 seconds, plug it into a different port and press **Try again** (or rerun the script). It continues where it stopped.
+
+**"Not enough space".** Press **Change** in the app (or use `-OutDir`) to pick a drive with more free space, or an external hard drive.
+
+**Search deeper says "No USB disk found".** The deep scan starts by checking the drive again, so keep it plugged in until you are done.
 
 **Files in `files\` are missing, or the partition is "still unreadable".** Check `carved\` for the deep-scan results, then try TestDisk using the command the script prints.
 
@@ -94,15 +106,17 @@ Every push is checked by [CI](https://github.com/YousefYGhanem/usb-rescue/action
 - **Lint:** parse check, ASCII check and PSScriptAnalyzer.
 - **Model tests:** boot-sector repair on real file-system images, and two-pass imaging with bad sectors and drive dropouts.
 - **Download check:** confirms the PhotoRec download still matches the pinned SHA256 (also runs weekly).
+- **Desktop app:** builds the portable `USB-Rescue.exe` from source on every push. Release downloads are built by CI.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) to run the tests yourself, and [SECURITY.md](SECURITY.md) for what the script can and can't touch, and how to report a vulnerability.
 
 ## Requirements
 
-- Windows 10 or 11, with Windows PowerShell 5.1 (built in)
+- Windows 10 or 11 (64-bit), with Windows PowerShell 5.1 (built in)
+- For the app: the Microsoft Edge WebView2 runtime (built into Windows 11)
 - Administrator rights
 - Internet access only for the optional PhotoRec download
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The script downloads [TestDisk/PhotoRec](https://www.cgsecurity.org/) (GPL) at run time; it is not bundled.
+MIT, see [LICENSE](LICENSE). The app is built with [Tauri](https://tauri.app) (MIT/Apache-2.0). The script downloads [TestDisk/PhotoRec](https://www.cgsecurity.org/) (GPL) at run time; it is not bundled.

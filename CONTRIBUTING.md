@@ -22,6 +22,13 @@ These keep users' data safe:
 
 CI runs all of them, plus PSScriptAnalyzer, on every push and pull request.
 
+## The desktop app
+
+`app/` is a [Tauri 2](https://tauri.app) app: a plain HTML/CSS/JS front end (`app/ui`) and a small Rust back end (`app/src-tauri`) that runs `Recover-UsbDrive.ps1` and forwards its `-Events` progress to the window. The script is compiled into the exe, so every recovery change belongs in the script, not the app.
+
+- **UI only:** open `app/ui/index.html` through any local web server. Outside the app it uses a built-in mock that plays a short fake rescue.
+- **Build the exe:** install [Rust](https://rustup.rs) and Node.js, then run `npm install` and `npm run build` in `app/`. The output is `app/src-tauri/target/release/usb-rescue.exe`. The exe asks for Administrator rights, so start it from Explorer, not from a non-elevated terminal.
+
 ## Pull requests
 
 - Keep each pull request focused on one change, and describe what you tested and on which Windows version.

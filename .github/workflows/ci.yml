@@ -45,6 +45,27 @@ jobs:
       - shell: powershell
         run: .\tests\windows-e2e.ps1
 
+  app:
+    name: Desktop app (portable exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - shell: powershell
+        working-directory: app
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci --no-fund --no-audit
+          npm run build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item src-tauri\target\release\usb-rescue.exe ..\USB-Rescue.exe
+          Write-Host "::notice::USB-Rescue.exe $([math]::Round((Get-Item ..\USB-Rescue.exe).Length / 1MB, 1)) MB"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: USB-Rescue
+          path: USB-Rescue.exe
+
   photorec-download:
     name: PhotoRec download matches pinned SHA256
     runs-on: windows-latest
