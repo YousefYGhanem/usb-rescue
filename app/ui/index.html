@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>USB Rescue</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="bar">
+    <div class="dots" id="dots" role="img" aria-label="Step 1 of 4"><i></i><i></i><i></i><i></i></div>
+    <button class="icon-btn" id="helpBtn" aria-label="Help">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg>
+    </button>
+  </header>
+
+  <div class="body">
+    <main class="stage">
+      <button class="pill ghost panel-btn" id="panelBtn" aria-expanded="true" aria-controls="panel" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h6"/></svg><span>Hide details</span>
+      </button>
+
+      <!-- 1. Choose the drive -->
+      <section class="screen" id="s-pick">
+        <div class="hero-icon">
+          <div class="pulse"></div>
+          <div class="float">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2" width="10" height="7" rx="1"/><path d="M5 9h14v9a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4z"/><path d="M10 5h1M13 5h1"/></svg>
+          </div>
+        </div>
+        <div>
+          <h1>Let's get your files back.</h1>
+          <p class="lead" id="pickLead">Choose the drive Windows says is broken. We never change it, we only make a copy.</p>
+        </div>
+        <div class="drives" id="drives" aria-live="polite"></div>
+        <p class="note warn-note" id="paused" hidden>Paused. Press the button again to continue where it stopped.</p>
+        <div class="actions-col">
+          <button class="pill primary big" id="startBtn" disabled>Rescue my files</button>
+          <span class="small">Saving to <b id="outDir">...</b> <button class="link" id="changeBtn">Change</button></span>
+          <span class="small subtle">If Windows asks to format the drive, click <b>Cancel</b>.</span>
+        </div>
+      </section>
+
+      <!-- 2. Safe copy -->
+      <section class="screen" id="s-copy" hidden>
+        <div class="ring">
+          <svg viewBox="0 0 220 220" aria-hidden="true"><circle class="track" cx="110" cy="110" r="96"/><circle class="fill" id="ringFill" cx="110" cy="110" r="96"/></svg>
+          <div class="ring-text"><span class="pct" id="pct">0%</span><span class="small" id="copied">Getting ready</span></div>
+        </div>
+        <div>
+          <h1 id="copyTitle">Copying your drive safely</h1>
+          <p class="lead" id="copyLine">Healthy parts first. Damaged parts get a careful second try at the end.</p>
+        </div>
+        <button class="pill soft" id="pauseBtn">Pause</button>
+      </section>
+
+      <!-- 3. Repair, copy out and deep scan -->
+      <section class="screen" id="s-work" hidden>
+        <div class="blob-wrap">
+          <div class="blob spin"></div>
+          <div class="blob inner"></div>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.5-.5-.5-2.5z"/></svg>
+        </div>
+        <div>
+          <h1 id="workTitle">Fixing the copy</h1>
+          <p class="lead breathe" id="workLine">Checking the partition table...</p>
+        </div>
+        <button class="pill soft" id="stopBtn">Stop</button>
+      </section>
+
+      <!-- 4. Done -->
+      <section class="screen" id="s-done" hidden>
+        <div class="pop"><div class="blob ok"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12l5 5L20 7"/></svg></div></div>
+        <div>
+          <h1 id="doneTitle">All done. Your files are safe.</h1>
+          <p class="lead" id="doneLine"></p>
+        </div>
+        <div class="actions-row">
+          <button class="pill primary big" id="openFilesBtn">Show my files</button>
+          <button class="pill soft big" id="deepBtn">Search deeper</button>
+        </div>
+        <span class="small subtle" id="doneHint">Thinking of reusing the drive? Test it first with H2testw or f3: cheap sticks often fake their size.</span>
+        <button class="link" id="againBtn">Rescue another drive</button>
+      </section>
+
+      <!-- Problem -->
+      <section class="screen" id="s-error" hidden>
+        <div class="err-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v5M12 16.5h.01"/><circle cx="12" cy="12" r="10"/></svg></div>
+        <div>
+          <h1>Something got in the way</h1>
+          <p class="lead" id="errLine"></p>
+        </div>
+        <div class="actions-row">
+          <button class="pill primary big" id="retryBtn">Try again</button>
+          <button class="pill soft big" id="errBackBtn">Back</button>
+        </div>
+        <span class="small subtle">Nothing is lost: the next try continues where this one stopped.</span>
+      </section>
+    </main>
+
+    <aside class="panel" id="panel" aria-label="What's happening" hidden>
+      <div class="panel-in">
+        <h2>What's happening</h2>
+        <ol class="timeline" id="timeline">
+          <li><span class="dot"></span><div><b>Choose drive</b><small id="tl0">-</small></div></li>
+          <li><span class="dot"></span><div><b>Safe copy</b><small id="tl1">Read-only, resumable</small></div></li>
+          <li><span class="dot"></span><div><b>Repair</b><small id="tl2">Done on the copy, not your drive</small></div></li>
+          <li><span class="dot"></span><div><b>Your files</b><small id="tl3">Names and folders kept</small></div></li>
+        </ol>
+        <div class="stats">
+          <div><small>Speed</small><b id="stSpeed">-</b></div>
+          <div><small>Damaged</small><b id="stBad">0 MB</b></div>
+        </div>
+        <details class="log">
+          <summary>Technical log</summary>
+          <pre id="log" tabindex="0"></pre>
+        </details>
+        <p class="safe"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6z"/><path d="M9 12l2 2 4-4"/></svg>Your drive is only read, never changed</p>
+      </div>
+    </aside>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -29,6 +29,7 @@ What the script does, and doesn't do, so you can check it before running it as A
 | Network | One optional download: TestDisk/PhotoRec 7.2 from `https://www.cgsecurity.org`, only when you accept the deep scan. Its **SHA256 is pinned** in the script; a mismatched file is deleted and never run. CI re-checks the pinned hash every week. |
 | Telemetry | None. Nothing about you, your drive or your files leaves your PC. |
 | Administrator rights | Needed for raw disk reads, mounting the VHD copy and `chkdsk`. |
+| Desktop app | Runs the same script, which is compiled into the exe and piped to `powershell.exe` (full System32 path) through stdin, never written to disk. The window loads only its own bundled files. No remote content, and a strict content security policy. |
 
 ## Staying safe as a user
 

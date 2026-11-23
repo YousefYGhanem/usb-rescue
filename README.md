@@ -10,16 +10,20 @@ Use it when Windows shows one of these:
 - *"You need to format the disk in drive E: before you can use it."*
 - Disk Management lists the drive's file system as **RAW**.
 
-usb-rescue is a single PowerShell script for Windows 10/11. It needs nothing to install and **never writes to your drive**: it copies the drive sector by sector first, and does all repairs on the copy.
+usb-rescue is a portable app for Windows 10/11: one `.exe`, nothing to install. It **never writes to your drive**. It copies the drive sector by sector first and does all repairs on the copy.
 
 ---
 
 ## Quick start
 
-1. **Download** the ZIP from the [latest release](https://github.com/YousefYGhanem/usb-rescue/releases/latest), then unzip it.
-2. **Plug in the broken drive.** Plug in only that one USB drive, and use a port on the back of the PC.
-3. **Double-click `Recover-UsbDrive.bat`** and click **Yes** on the Administrator prompt.
-4. Follow the prompts. If Windows offers to **format** anything, click **Cancel**.
+1. **Download `USB-Rescue.exe`** from the [latest release](https://github.com/YousefYGhanem/usb-rescue/releases/latest).
+2. **Plug in the broken drive**, using a port on the back of the PC.
+3. **Double-click `USB-Rescue.exe`** and click **Yes** on the Administrator prompt.
+4. Choose the drive and press **Rescue my files**. If Windows offers to **format** anything, click **Cancel**.
+
+The app needs the Microsoft Edge WebView2 runtime. It is built into Windows 11 and installed on nearly every up-to-date Windows 10 PC. If the app doesn't open, [install WebView2](https://developer.microsoft.com/microsoft-edge/webview2/).
+
+**Prefer the command line?** Download the ZIP, unzip it, and double-click `Recover-UsbDrive.bat` (see [Options](#options)). The app and the script do exactly the same recovery.
 
 You need free space of about **twice the USB drive's size** on another drive. Results go to `<drive with most free space>:\UsbRecovery`.
 
@@ -67,6 +71,8 @@ powershell -ExecutionPolicy Bypass -File .\Recover-UsbDrive.ps1 [-DiskNumber 2] 
 | `-OutDir` | Where to save results. Must be on another drive |
 | `-SkipCarve` | Don't offer the PhotoRec deep scan |
 | `-Yes` | No prompts: take the default answer everywhere (for automation). Needs `-DiskNumber` if several USB disks are plugged in |
+| `-Carve` | Run the PhotoRec deep scan without asking |
+| `-Events`, `-ListDrives` | Machine-readable progress and drive list, used by the desktop app |
 
 ## Troubleshooting
 

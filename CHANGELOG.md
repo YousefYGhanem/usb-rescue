@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 - unreleased
+
+### Added
+- **USB Rescue desktop app** (`USB-Rescue.exe`): one portable file with nothing to install. Pick the drive, press one button, and follow the copy, repair and file recovery in plain language. A "What's happening" panel shows each step, the speed, damaged areas and the full technical log. The app follows the Windows light/dark theme and the reduced-motion setting.
+- The app runs the same script underneath. The script is compiled into the exe and passed to PowerShell through stdin, never written to disk, so nothing can swap it before it runs as Administrator.
+- New script options for the app: `-Events` (progress as JSON lines), `-ListDrives` (USB drives and the default output folder) and `-Carve` (run the deep scan without asking).
+
 ## 1.2.0 - 2026-11-02
 
 ### Added
